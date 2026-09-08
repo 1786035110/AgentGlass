@@ -1,0 +1,43 @@
+{
+  "name": "agentglass",
+  "version": "0.1.0-alpha.0",
+  "description": "A novice outcome layer for Pi. Engineering baseline only; outcome approval is not implemented yet.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "npm@11.9.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/1786035110/AgentGlass.git"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "extensions",
+    "dist"
+  ],
+  "pi": {
+    "extensions": [
+      "extensions/agentglass.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "build": "tsc -p tsconfig.build.json",
+    "test:integration": "vitest run tests/integration"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.12",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
+}
