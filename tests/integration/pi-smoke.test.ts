@@ -53,7 +53,15 @@ test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", asy
     );
     expect(extension?.commands.size).toBe(0);
     expect(extension?.tools.size).toBe(0);
-    expect(extension?.handlers.size).toBe(0);
+    expect(extension).toBeDefined();
+    expect([...(extension?.handlers.keys() ?? [])].sort()).toEqual([
+      "agent_end",
+      "before_agent_start",
+      "session_shutdown",
+      "session_start",
+      "tool_call",
+      "tool_execution_end",
+    ]);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

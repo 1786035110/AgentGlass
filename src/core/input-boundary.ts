@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { types } from "node:util";
 import type {
-  ActionFingerprint,
+  ProjectedActionInput,
   RedactedPersistableInput,
   TransientRawInput,
 } from "./domain.js";
@@ -29,12 +29,6 @@ export class InputBoundaryError extends Error {
     this.name = "InputBoundaryError";
     this.code = code;
   }
-}
-
-export interface ProjectedActionInput {
-  readonly fingerprint: ActionFingerprint;
-  readonly redactedInput: RedactedPersistableInput;
-  readonly secretDetected: boolean;
 }
 
 const canonicalPrefix = `${CANONICALIZATION_SCHEMA}-v${CANONICALIZATION_VERSION}\n`;

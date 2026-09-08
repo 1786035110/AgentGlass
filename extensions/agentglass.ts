@@ -1,4 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerPiAdapter } from "../src/adapter/pi/adapter.js";
 
-// Alpha 阶段仅保留可被 Pi 发现的入口；具体拦截与审批能力按开发任务逐步接入。
-export default function agentglass(_pi: ExtensionAPI): void {}
+// 唯一 Pi 入口只负责装配 Adapter；分类、风险和审批仍由后续明确任务实现。
+export default function agentglass(pi: ExtensionAPI): void {
+  registerPiAdapter(pi);
+}

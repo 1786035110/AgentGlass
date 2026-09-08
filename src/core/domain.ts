@@ -72,6 +72,74 @@ export type VerificationCorrelation = Readonly<
 
 export type TransientRawInput = unknown;
 
+// A-004 只表达宿主已经观察到的交互能力，不把具体宿主的 mode/ctx 形状带入 Core。
+export type HostInteractionKind =
+  | "local_interactive"
+  | "remote_interactive"
+  | "event_stream"
+  | "one_shot"
+  | "unknown";
+
+export interface HostCapabilities {
+  interaction: HostInteractionKind;
+  canPromptForApproval: TriState;
+}
+
+// 工具来源是安全事实：同名覆盖不能因为名字相同就冒充已验证内置工具。
+export type HostToolIdentityStatus =
+  | "verified_builtin"
+  | "external"
+  | "overridden"
+  | "unknown";
+
+export interface HostToolIdentity {
+  name: string;
+  status: HostToolIdentityStatus;
+}
+
+export interface SiblingExecutionReference {
+  hostExecutionId: string;
+  toolCallId: string;
+  tool: HostToolIdentity;
+}
+
+export type ObservableUserGoal =
+  | { status: "observed"; redactedText: RedactedPersistableInput }
+  | { status: "unknown" };
+
+// 只有 rawInput 可在一次同步预检调用中短暂存在；用户目标在 Adapter 捕获时已完成脱敏。
+export interface TransientHostExecutionInput {
+  hostExecutionId: string;
+  toolCallId: string;
+  sessionId: string;
+  cwd: string;
+  tool: HostToolIdentity;
+  capabilities: HostCapabilities;
+  siblings: readonly SiblingExecutionReference[];
+  userGoal: ObservableUserGoal;
+  rawInput: TransientRawInput;
+}
+
+export interface ProjectedActionInput {
+  readonly fingerprint: ActionFingerprint;
+  readonly redactedInput: RedactedPersistableInput;
+  readonly secretDetected: boolean;
+}
+
+// 可观察结果已经越过 raw 边界，可由后续 Alpha 任务消费；仍不包含风险或批准结论。
+export interface HostExecutionFacts {
+  hostExecutionId: string;
+  toolCallId: string;
+  sessionId: string;
+  cwd: string;
+  tool: HostToolIdentity;
+  capabilities: HostCapabilities;
+  siblings: readonly SiblingExecutionReference[];
+  userGoal: ObservableUserGoal;
+  input: ProjectedActionInput;
+  evidenceCodes: readonly string[];
+}
+
 type JsonValue =
   | null
   | boolean
