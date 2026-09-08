@@ -29,6 +29,7 @@
     "lint": "biome check .",
     "build": "tsc -p tsconfig.build.json",
     "test:unit": "vitest run tests/unit",
+    "test:corpus": "vitest run tests/corpus",
     "test:security": "vitest run tests/security",
     "test:integration": "vitest run tests/integration"
   },

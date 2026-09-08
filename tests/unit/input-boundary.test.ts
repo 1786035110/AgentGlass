@@ -136,8 +136,12 @@ test("enforces canonical depth and UTF-8 byte limits", () => {
 
 test("redaction failure is fail-closed and never falls back to raw input", () => {
   const syntheticSecret = "synthetic-redaction-failure-secret";
-  const freeze = vi.spyOn(Object, "freeze").mockImplementationOnce(() => {
-    throw new Error(syntheticSecret);
+  const originalFreeze = Object.freeze;
+  let freezeCalls = 0;
+  const freeze = vi.spyOn(Object, "freeze").mockImplementation((value) => {
+    freezeCalls += 1;
+    if (freezeCalls === 2) throw new Error(syntheticSecret);
+    return originalFreeze(value);
   });
 
   let caught: unknown;

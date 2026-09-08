@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { types } from "node:util";
 import type {
+  ActionFingerprint,
   ProjectedActionInput,
   RedactedPersistableInput,
   TransientRawInput,
@@ -215,6 +216,24 @@ function canonicalize(toolName: string, input: TransientRawInput): string {
   return writer.finish();
 }
 
+export function fingerprintTransientActionInput(
+  toolName: string,
+  input: TransientRawInput,
+): ActionFingerprint {
+  const canonical = canonicalize(toolName, input);
+  let value: string;
+  try {
+    value = createHash("sha256").update(canonical, "utf8").digest("hex");
+  } catch {
+    throw new InputBoundaryError("FINGERPRINT_FAILED");
+  }
+  return Object.freeze({
+    algorithm: "sha256",
+    canonicalizationVersion: CANONICALIZATION_VERSION,
+    value,
+  });
+}
+
 const secretFieldWords = new Set([
   "authorization",
   "cookie",
@@ -344,13 +363,7 @@ export function projectTransientActionInput(
 ): ProjectedActionInput {
   // A-003 的顺序边界：先用完整 raw 语义生成版本化 canonical 字节，
   // 再计算 SHA-256，最后才进行 secret 检测与脱敏投影。canonical 不会越过本函数边界。
-  const canonical = canonicalize(toolName, input);
-  let value: string;
-  try {
-    value = createHash("sha256").update(canonical, "utf8").digest("hex");
-  } catch {
-    throw new InputBoundaryError("FINGERPRINT_FAILED");
-  }
+  const fingerprint = fingerprintTransientActionInput(toolName, input);
 
   const state: RedactionState = { secretDetected: false };
   let redactedInput: RedactedPersistableInput;
@@ -361,9 +374,7 @@ export function projectTransientActionInput(
   }
   return Object.freeze({
     fingerprint: Object.freeze({
-      algorithm: "sha256",
-      canonicalizationVersion: CANONICALIZATION_VERSION,
-      value,
+      ...fingerprint,
     }),
     redactedInput,
     secretDetected: state.secretDetected,

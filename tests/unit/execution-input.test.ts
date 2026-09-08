@@ -8,7 +8,7 @@ import {
   projectObservableUserGoal,
 } from "../../src/core/execution-input.js";
 
-test("host execution projection removes raw input and keeps only the redacted observable goal", () => {
+test("host execution projection removes raw input and keeps only the redacted observable goal", async () => {
   const transient: TransientHostExecutionInput = {
     hostExecutionId: "execution-1",
     toolCallId: "call-1",
@@ -27,7 +27,7 @@ test("host execution projection removes raw input and keeps only the redacted ob
     },
   };
 
-  const facts = projectHostExecutionInput(transient);
+  const facts = await projectHostExecutionInput(transient);
   const serialized = JSON.stringify(facts);
   expect(serialized).not.toContain("synthetic-goal-credential");
   expect(serialized).not.toContain("synthetic-tool-credential");

@@ -25,6 +25,21 @@ test("the Alpha schema preserves unknown safety facts and exact identities", () 
     mutatesState: "unknown",
     outsideWorkspace: "unknown",
     sensitive: "unknown",
+    targets: [
+      {
+        targetId: "target-1",
+        label: "配置文件",
+        workspaceScope: "unknown",
+        state: "unknown",
+        linked: "unknown",
+        supportedPath: "unknown",
+        evidenceCodes: ["ACTION_UNKNOWN"],
+      },
+    ],
+    impactFacts: {
+      effect: "unknown",
+      createsParentDirectories: "unknown",
+    },
     evidenceCodes: ["ACTION_UNKNOWN"],
     fingerprint,
   };

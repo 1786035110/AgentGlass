@@ -259,35 +259,32 @@ export function registerPiAdapter(
     }
   });
   pi.on("tool_call", (event, ctx) => {
-    let executionId: string | undefined;
-    let facts: HostExecutionFacts;
+    let transient: TransientHostExecutionInput;
     try {
-      facts = projectHostExecutionInput(
-        mapToolCall(pi, event, ctx, sessionId, activeExecutions, userGoal),
+      transient = mapToolCall(
+        pi,
+        event,
+        ctx,
+        sessionId,
+        activeExecutions,
+        userGoal,
       );
-      executionId = facts.hostExecutionId;
-      activeExecutions.set(event.toolCallId, executionId);
+      activeExecutions.set(event.toolCallId, transient.hostExecutionId);
     } catch {
-      if (executionId) activeExecutions.delete(event.toolCallId);
       return { block: true, reason: BLOCK_REASON };
     }
 
     const toolCallId = event.toolCallId;
-    try {
-      const observation = observe(facts);
-      if (!observation) return undefined;
-      // Promise 链只捕获已脱敏 facts；同步 handler 返回后不再持有 Pi event/ctx/raw input。
-      return Promise.resolve(observation).then(
+    // 文件真实路径检查是异步的；raw input 只活到本 Promise 完成，observer 只接收脱敏 facts。
+    return projectHostExecutionInput(transient)
+      .then((facts) => observe(facts))
+      .then(
         () => undefined,
         () => {
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: BLOCK_REASON };
         },
       );
-    } catch {
-      activeExecutions.delete(toolCallId);
-      return { block: true, reason: BLOCK_REASON };
-    }
   });
   pi.on("tool_execution_end", (event) => {
     activeExecutions.delete(event.toolCallId);

@@ -19,6 +19,31 @@ export interface ExecutionBinding {
   toolCallId: string;
 }
 
+export type WorkspaceScope = "inside" | "outside" | "unknown";
+export type FileTargetState =
+  | "existing_file"
+  | "new_file"
+  | "missing"
+  | "directory"
+  | "special"
+  | "unknown";
+
+// 路径事实只保留不透明身份、脱敏标签和确定性证据；真实路径仍只存在于一次预检调用栈中。
+export interface FileTargetFacts {
+  targetId: string;
+  label: string;
+  workspaceScope: WorkspaceScope;
+  state: FileTargetState;
+  linked: TriState;
+  supportedPath: TriState;
+  evidenceCodes: readonly string[];
+}
+
+export interface FileImpactFacts {
+  effect: "read" | "create" | "overwrite" | "edit" | "unknown";
+  createsParentDirectories: TriState;
+}
+
 // ActionFacts 是脱离 Pi 宿主后的安全事实集合，不包含原始输入或“安全”布尔捷径。
 export interface ActionFacts {
   actionId: string;
@@ -27,7 +52,9 @@ export interface ActionFacts {
   mutatesState: TriState;
   outsideWorkspace: TriState;
   sensitive: TriState;
-  evidenceCodes: string[];
+  targets: readonly FileTargetFacts[];
+  impactFacts: FileImpactFacts;
+  evidenceCodes: readonly string[];
   fingerprint: ActionFingerprint;
 }
 
@@ -137,6 +164,7 @@ export interface HostExecutionFacts {
   siblings: readonly SiblingExecutionReference[];
   userGoal: ObservableUserGoal;
   input: ProjectedActionInput;
+  action: ActionFacts;
   evidenceCodes: readonly string[];
 }
 

@@ -3,6 +3,7 @@ import type {
   ObservableUserGoal,
   TransientHostExecutionInput,
 } from "./domain.js";
+import { classifyFileAction } from "./file-classification.js";
 import { projectTransientActionInput } from "./input-boundary.js";
 
 export function projectObservableUserGoal(prompt: string): ObservableUserGoal {
@@ -14,14 +15,16 @@ export function projectObservableUserGoal(prompt: string): ObservableUserGoal {
   });
 }
 
-export function projectHostExecutionInput(
+export async function projectHostExecutionInput(
   transient: TransientHostExecutionInput,
-): HostExecutionFacts {
-  // 工具 raw input 在这里完成 fingerprint-first 投影；返回对象不保留它的引用。
-  const input = projectTransientActionInput(
-    transient.tool.name,
-    transient.rawInput,
-  );
+): Promise<HostExecutionFacts> {
+  // classifier 在同一调用栈内执行 fingerprint → raw path preflight → redaction。
+  const { action, input } = await classifyFileAction({
+    actionId: transient.hostExecutionId,
+    cwd: transient.cwd,
+    tool: transient.tool,
+    rawInput: transient.rawInput,
+  });
   const evidenceCodes = [
     ...(transient.tool.status === "unknown" ? ["TOOL_IDENTITY_UNKNOWN"] : []),
     ...(transient.tool.status === "overridden"
@@ -44,6 +47,7 @@ export function projectHostExecutionInput(
     siblings: transient.siblings,
     userGoal: transient.userGoal,
     input,
+    action,
     evidenceCodes: Object.freeze(evidenceCodes),
   });
 }

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -175,6 +175,109 @@ test("Pi 0.85.1 maps the current goal, current siblings, and real execution iden
     "old-call",
   );
   expect(facts?.siblings[0]?.hostExecutionId).toBe(facts?.hostExecutionId);
+});
+
+test("Pi 0.85.1 verified read/write/edit identities use their locked schemas", async () => {
+  const runtime = await createRuntime();
+  await writeFile(join(runtime.cwd, "existing.txt"), "before", "utf8");
+  await setGoal(runtime, "classify built-in file tools");
+  const schemas = Object.fromEntries(
+    runtime.session
+      .getAllTools()
+      .filter((tool) => ["read", "write", "edit"].includes(tool.name))
+      .map((tool) => [tool.name, tool.parameters]),
+  );
+  expect(schemas).toMatchObject({
+    read: {
+      required: ["path"],
+      properties: {
+        path: { type: "string" },
+        offset: { type: "number" },
+        limit: { type: "number" },
+      },
+    },
+    write: {
+      required: ["path", "content"],
+      properties: { path: { type: "string" }, content: { type: "string" } },
+    },
+    edit: {
+      required: ["path", "edits"],
+      properties: {
+        path: { type: "string" },
+        edits: {
+          type: "array",
+          items: {
+            required: ["oldText", "newText"],
+            properties: {
+              oldText: { type: "string" },
+              newText: { type: "string" },
+            },
+          },
+        },
+      },
+    },
+  });
+
+  const calls = [
+    { id: "read-file", name: "read", arguments: { path: "existing.txt" } },
+    {
+      id: "write-file",
+      name: "write",
+      arguments: { path: "new.txt", content: "new" },
+    },
+    {
+      id: "edit-file",
+      name: "edit",
+      arguments: {
+        path: "existing.txt",
+        edits: [{ oldText: "before", newText: "after" }],
+      },
+    },
+  ];
+
+  for (const call of calls) {
+    await emitCall(runtime, call);
+    await runtime.session.extensionRunner.emit({
+      type: "tool_execution_end",
+      toolCallId: call.id,
+      toolName: call.name,
+      result: {},
+      isError: false,
+    });
+  }
+
+  expect(
+    runtime.observed.map(({ tool, action }) => ({ tool, action })),
+  ).toMatchObject([
+    {
+      tool: { name: "read", status: "verified_builtin" },
+      action: {
+        kind: "read",
+        mutatesState: "no",
+        impactFacts: { effect: "read" },
+      },
+    },
+    {
+      tool: { name: "write", status: "verified_builtin" },
+      action: {
+        kind: "write",
+        mutatesState: "yes",
+        impactFacts: { effect: "create" },
+      },
+    },
+    {
+      tool: { name: "edit", status: "verified_builtin" },
+      action: {
+        kind: "edit",
+        mutatesState: "yes",
+        impactFacts: { effect: "edit" },
+      },
+    },
+  ]);
+  for (const facts of runtime.observed) {
+    expect(facts.action.evidenceCodes).toContain("TOOL_IDENTITY_VERIFIED");
+    expect(facts.action.evidenceCodes).toContain("TOOL_SCHEMA_VERIFIED");
+  }
 });
 
 test("Pi 0.85.1 capability modes do not equate hasUI with safe approval", async () => {
