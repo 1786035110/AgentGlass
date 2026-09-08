@@ -10,6 +10,7 @@ const forbidden = [
   /\bhost\s*:\s*["']pi["']|["']\.pi[\\/"']/i,
 ];
 
+// 通过源码扫描守住宿主边界，防止核心层意外依赖 Pi API 或语义。
 function violations(source: string): number {
   return forbidden.filter((pattern) => pattern.test(source)).length;
 }

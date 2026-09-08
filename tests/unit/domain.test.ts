@@ -11,6 +11,7 @@ import type {
   VerificationCorrelation,
 } from "../../src/core/domain.js";
 
+// 验证未知状态不会被压缩成 safe，并确认审批与后续验证仍保留精确关联身份。
 test("the Alpha schema preserves unknown safety facts and exact identities", () => {
   const fingerprint = {
     algorithm: "sha256",
@@ -75,9 +76,10 @@ test("the Alpha schema preserves unknown safety facts and exact identities", () 
   expectTypeOf<VerificationCorrelation>().not.toHaveProperty("targetLabel");
 });
 
+// 验证包含敏感信息的原始输入不能越过脱敏边界进入可持久化类型。
 test("raw input is not assignable to the redacted persistable boundary", () => {
   const raw: TransientRawInput = { password: "secret" };
-  // @ts-expect-error 原始输入必须经过未来的 A-003 脱敏器。
+  // @ts-expect-error 原始输入必须经过 A-003 脱敏边界。
   const persisted: RedactedPersistableInput = raw;
   expect(persisted).toBe(raw);
 });
