@@ -275,6 +275,11 @@ function isSecretValue(value: string): boolean {
   return secretValuePatterns.some((pattern) => pattern.test(value));
 }
 
+export function redactDisplayString(value: string): string {
+  // 展示层只能复用与 raw 投影相同的秘密判定；命中后整段替换，避免截断或格式化时泄漏局部凭据。
+  return isSecretValue(value) ? REDACTION_MARKER : value;
+}
+
 interface RedactionState {
   secretDetected: boolean;
 }
