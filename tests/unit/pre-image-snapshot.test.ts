@@ -16,6 +16,7 @@ import {
   SNAPSHOT_ENTRY_LIMIT,
   SNAPSHOT_FILE_LIMIT_BYTES,
   SNAPSHOT_TOTAL_LIMIT_BYTES,
+  verifyPreImageSnapshotBaseline,
 } from "../../src/core/pre-image-snapshot.js";
 
 const temporaryDirectories: string[] = [];
@@ -123,6 +124,92 @@ test("records a new file as not existing without inventing permissions", async (
     canRestoreNow: false,
     recoveryGrade: "unknown",
   });
+});
+
+test("approval baseline rejects a changed existing file or newly appeared file", async () => {
+  const existing = await setup();
+  const existingPath = path.join(existing.workspace, "existing.txt");
+  await writeFile(existingPath, "before", "utf8");
+  const existingTarget = {
+    actionId: "action-existing-baseline",
+    targetId: "target-existing-baseline",
+    targetPath: existingPath,
+    targetExisted: true,
+  };
+  const existingSnapshot = await capturePreImageSnapshot(
+    existing.snapshotRoot,
+    existingTarget,
+  );
+  expect(
+    await verifyPreImageSnapshotBaseline(
+      existing.snapshotRoot,
+      existingSnapshot,
+      existingTarget,
+    ),
+  ).toBe(true);
+  await writeFile(existingPath, "changed", "utf8");
+  expect(
+    await verifyPreImageSnapshotBaseline(
+      existing.snapshotRoot,
+      existingSnapshot,
+      existingTarget,
+    ),
+  ).toBe(false);
+
+  const created = await setup();
+  const newPath = path.join(created.workspace, "new.txt");
+  const absenceTarget = {
+    actionId: "action-absence-baseline",
+    targetId: "target-absence-baseline",
+    targetPath: newPath,
+    targetExisted: false,
+  };
+  const absenceSnapshot = await capturePreImageSnapshot(
+    created.snapshotRoot,
+    absenceTarget,
+  );
+  expect(
+    await verifyPreImageSnapshotBaseline(
+      created.snapshotRoot,
+      absenceSnapshot,
+      absenceTarget,
+    ),
+  ).toBe(true);
+  await writeFile(newPath, "appeared", "utf8");
+  expect(
+    await verifyPreImageSnapshotBaseline(
+      created.snapshotRoot,
+      absenceSnapshot,
+      absenceTarget,
+    ),
+  ).toBe(false);
+});
+
+test("approval baseline rejects an oversized manifest through the bounded reader", async () => {
+  const fixture = await setup();
+  const targetPath = path.join(fixture.workspace, "bounded.txt");
+  await writeFile(targetPath, "before", "utf8");
+  const target = {
+    actionId: "action-bounded-manifest",
+    targetId: "target-bounded-manifest",
+    targetPath,
+    targetExisted: true,
+  };
+  const snapshot = await capturePreImageSnapshot(fixture.snapshotRoot, target);
+  if (!snapshot.snapshotId) throw new Error("snapshot was not saved");
+  await writeFile(
+    path.join(fixture.snapshotRoot, `${snapshot.snapshotId}.manifest.json`),
+    "x".repeat(64 * 1024 + 1),
+    "utf8",
+  );
+
+  expect(
+    await verifyPreImageSnapshotBaseline(
+      fixture.snapshotRoot,
+      snapshot,
+      target,
+    ),
+  ).toBe(false);
 });
 
 test("downgrades per-file and total resource limit failures", async () => {

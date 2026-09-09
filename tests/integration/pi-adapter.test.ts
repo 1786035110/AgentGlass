@@ -1,18 +1,27 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createAgentSession,
   createReadToolDefinition,
   DefaultResourceLoader,
+  type ExtensionUIContext,
   ModelRuntime,
   SessionManager,
   SettingsManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { registerPiAdapter } from "../../src/adapter/pi/adapter.js";
-import type { HostExecutionFacts } from "../../src/core/domain.js";
+import {
+  consumeApprovalToken,
+  executionBinding,
+  issueApprovalToken,
+} from "../../src/core/approval.js";
+import type {
+  ExecutionBinding,
+  HostExecutionFacts,
+} from "../../src/core/domain.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -50,7 +59,10 @@ function assistantMessage(
   };
 }
 
-async function createRuntime(options?: { overriddenRead?: boolean }) {
+async function createRuntime(options?: {
+  overriddenRead?: boolean;
+  snapshotUnavailable?: boolean;
+}) {
   const cwd = await mkdtemp(join(tmpdir(), "agentglass-adapter-"));
   temporaryDirectories.push(cwd);
   const observed: HostExecutionFacts[] = [];
@@ -62,14 +74,18 @@ async function createRuntime(options?: { overriddenRead?: boolean }) {
     extensionFactories: [
       {
         name: "agentglass-integration",
-        factory: (pi) =>
-          registerPiAdapter(
-            pi,
-            (facts) => {
-              observed.push(facts);
-            },
-            join(cwd, ".agentglass", "snapshots"),
-          ),
+        factory: (pi) => {
+          const observer = (facts: HostExecutionFacts) => {
+            observed.push(facts);
+          };
+          if (options?.snapshotUnavailable) registerPiAdapter(pi, observer);
+          else
+            registerPiAdapter(
+              pi,
+              observer,
+              join(cwd, ".agentglass", "snapshots"),
+            );
+        },
       },
     ],
     noExtensions: true,
@@ -103,6 +119,98 @@ async function createRuntime(options?: { overriddenRead?: boolean }) {
   });
   await session.bindExtensions({ mode: "print" });
   return { cwd, observed, session, sessionManager };
+}
+
+interface ApprovalUiStep {
+  inputs?: string[];
+  widths?: number[];
+  missingResult?: boolean;
+  error?: boolean;
+  onOpen?: () => void | Promise<void>;
+}
+
+interface TestComponent {
+  render(width: number): string[];
+  handleInput?(data: string): void;
+  dispose?(): void;
+}
+
+type TestCustomFactory<T> = (
+  tui: { requestRender(): void },
+  theme: unknown,
+  keybindings: { matches(data: string, key: string): boolean },
+  done: (value: T) => void,
+) => TestComponent | Promise<TestComponent>;
+
+function installApprovalUi(
+  runtime: Awaited<ReturnType<typeof createRuntime>>,
+  steps: ApprovalUiStep[],
+  mode: "tui" | "rpc" = "tui",
+) {
+  const runner = runtime.session.extensionRunner;
+  const base = runner.getUIContext();
+  const rendered: string[][] = [];
+  const statuses: Array<{ key: string; text: string | undefined }> = [];
+  let customCalls = 0;
+  let doneCalls = 0;
+  const custom = (async <T>(factory: TestCustomFactory<T>) => {
+    const step = steps[customCalls++];
+    if (!step || step.error) throw new Error("synthetic UI error");
+    if (step.missingResult) return undefined as T;
+    await step.onOpen?.();
+    let resolveResult: (value: T) => void = () => {};
+    const resultPromise = new Promise<T>((resolve) => {
+      resolveResult = resolve;
+    });
+    const component = await factory(
+      { requestRender: () => {} },
+      base.theme,
+      {
+        matches: (data: string, key: string) =>
+          data ===
+          (
+            {
+              "tui.select.cancel": "esc",
+              "tui.select.up": "up",
+              "tui.select.down": "down",
+              "tui.input.tab": "tab",
+              "tui.select.confirm": "enter",
+            } as Record<string, string>
+          )[key],
+      },
+      (value: T) => {
+        doneCalls++;
+        resolveResult(value);
+      },
+    );
+    for (const width of step.widths ?? [80])
+      rendered.push(component.render(width));
+    for (const input of step.inputs ?? []) {
+      component.handleInput?.(input);
+      rendered.push(component.render(step.widths?.[0] ?? 80));
+    }
+    const result = await resultPromise;
+    component.dispose?.();
+    return result;
+  }) as unknown as ExtensionUIContext["custom"];
+  runner.setUIContext(
+    {
+      ...base,
+      custom,
+      setStatus: (key, text) => statuses.push({ key, text }),
+    },
+    mode,
+  );
+  return {
+    rendered,
+    statuses,
+    get customCalls() {
+      return customCalls;
+    },
+    get doneCalls() {
+      return doneCalls;
+    },
+  };
 }
 
 async function setGoal(
@@ -721,4 +829,316 @@ test("raw tool and goal secrets never enter observable or blocked adapter output
     input: { content: secret },
   });
   expect(JSON.stringify(blocked)).not.toContain(secret);
+});
+
+test("Pi 0.85.1 TUI Continue is single-shot, Explain is not approval, Stop/Esc fail closed, and resize rerenders", async () => {
+  const continueRuntime = await createRuntime();
+  const continueUi = installApprovalUi(continueRuntime, [
+    { inputs: ["down", "down", "enter", "enter"], widths: [18, 80] },
+  ]);
+  const continueResult = await emitCall(continueRuntime, {
+    id: "continue-write",
+    name: "write",
+    arguments: { path: "continue.txt", content: "approved" },
+  });
+  expect(continueResult).toBeUndefined();
+  expect(continueUi.doneCalls).toBe(1);
+  expect(continueUi.rendered[0]?.every((line) => [...line].length <= 18)).toBe(
+    true,
+  );
+
+  const explainRuntime = await createRuntime();
+  const explainUi = installApprovalUi(explainRuntime, [
+    { inputs: ["down", "enter", "down", "enter"] },
+  ]);
+  expect(
+    await emitCall(explainRuntime, {
+      id: "explain-write",
+      name: "write",
+      arguments: { path: "explain.txt", content: "approved after details" },
+    }),
+  ).toBeUndefined();
+  expect(explainUi.doneCalls).toBe(1);
+  expect(explainUi.rendered.some((lines) => lines.includes("详情："))).toBe(
+    true,
+  );
+  expect(
+    explainUi.rendered.some((lines) =>
+      lines.join("").includes("查看详情不会批准修改"),
+    ),
+  ).toBe(true);
+
+  for (const [id, input] of [
+    ["stop-write", "enter"],
+    ["escape-write", "esc"],
+  ] as const) {
+    const runtime = await createRuntime();
+    installApprovalUi(runtime, [{ inputs: [input] }]);
+    expect(
+      await emitCall(runtime, {
+        id,
+        name: "write",
+        arguments: { path: `${id}.txt`, content: "must not run" },
+      }),
+    ).toMatchObject({
+      block: true,
+      reason: expect.stringContaining("没有批准"),
+    });
+  }
+});
+
+test("Pi 0.85.1 TUI runs the complete supported read/write/edit pre-execution chain", async () => {
+  const runtime = await createRuntime();
+  const ui = installApprovalUi(runtime, [
+    { inputs: ["down", "down", "enter"] },
+    { inputs: ["down", "down", "enter"] },
+  ]);
+  await writeFile(join(runtime.cwd, "existing.txt"), "before", "utf8");
+
+  expect(
+    await emitCall(runtime, {
+      id: "vertical-read",
+      name: "read",
+      arguments: { path: "existing.txt" },
+    }),
+  ).toBeUndefined();
+  expect(
+    await emitCall(runtime, {
+      id: "vertical-write",
+      name: "write",
+      arguments: { path: "created.txt", content: "created" },
+    }),
+  ).toBeUndefined();
+  const editArguments = {
+    path: "existing.txt",
+    edits: [{ oldText: "before", newText: "after" }],
+  };
+  expect(
+    await emitCall(runtime, {
+      id: "vertical-edit",
+      name: "edit",
+      arguments: editArguments,
+    }),
+  ).toBeUndefined();
+
+  expect(ui.customCalls).toBe(2);
+  expect(ui.statuses).toContainEqual({
+    key: "agentglass-read",
+    text: "正在查看：existing.txt，不会修改它。",
+  });
+  expect(runtime.observed.map((facts) => facts.action.kind)).toEqual([
+    "read",
+    "write",
+    "edit",
+  ]);
+  const edit = runtime.session.getToolDefinition("edit");
+  if (!edit) throw new Error("locked edit tool missing");
+  await edit.execute(
+    "vertical-edit",
+    editArguments,
+    undefined,
+    undefined,
+    undefined as never,
+  );
+  expect(await readFile(join(runtime.cwd, "existing.txt"), "utf8")).toBe(
+    "after",
+  );
+});
+
+test("Pi 0.85.1 abort, missing custom result, UI error, RPC hasUI, and no UI cannot approve", async () => {
+  const aborted = await createRuntime();
+  const abortUi = installApprovalUi(aborted, [{}]);
+  const pending = emitCall(aborted, {
+    id: "abort-write",
+    name: "write",
+    arguments: { path: "abort.txt", content: "must not run" },
+  });
+  await vi.waitFor(() => expect(abortUi.customCalls).toBe(1));
+  await aborted.session.extensionRunner.emit({
+    type: "agent_end",
+    messages: [],
+  });
+  await expect(pending).resolves.toMatchObject({ block: true });
+
+  for (const fixture of [
+    { name: "missing custom result", step: { missingResult: true } },
+    { name: "UI error", step: { error: true } },
+  ]) {
+    const runtime = await createRuntime();
+    installApprovalUi(runtime, [fixture.step]);
+    expect(
+      await emitCall(runtime, {
+        id: fixture.name,
+        name: "write",
+        arguments: { path: `${fixture.name}.txt`, content: "must not run" },
+      }),
+    ).toMatchObject({ block: true });
+  }
+
+  const rpc = await createRuntime();
+  const rpcUi = installApprovalUi(
+    rpc,
+    [{ inputs: ["down", "down", "enter"] }],
+    "rpc",
+  );
+  expect(
+    await emitCall(rpc, {
+      id: "rpc-write",
+      name: "write",
+      arguments: { path: "rpc.txt", content: "must not run" },
+    }),
+  ).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("本地审批界面"),
+  });
+  expect(rpcUi.customCalls).toBe(0);
+
+  const noUi = await createRuntime();
+  expect(
+    await emitCall(noUi, {
+      id: "print-write",
+      name: "write",
+      arguments: { path: "print.txt", content: "must not run" },
+    }),
+  ).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("本地审批界面"),
+  });
+  noUi.session.extensionRunner.setUIContext(undefined, "json");
+  expect(
+    await emitCall(noUi, {
+      id: "json-write",
+      name: "write",
+      arguments: { path: "json.txt", content: "must not run" },
+    }),
+  ).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("本地审批界面"),
+  });
+});
+
+test("Pi 0.85.1 regenerates the card after input change and executes only the exact current action", async () => {
+  const runtime = await createRuntime();
+  const call = {
+    id: "changed-write",
+    name: "write",
+    arguments: { path: "changed.txt", content: "first" },
+  };
+  const ui = installApprovalUi(runtime, [
+    {
+      onOpen: () => {
+        call.arguments.content = "second";
+      },
+      inputs: ["down", "down", "enter"],
+    },
+    { inputs: ["down", "down", "enter"] },
+  ]);
+
+  expect(await emitCall(runtime, call)).toBeUndefined();
+  expect(ui.customCalls).toBe(2);
+  expect(runtime.observed).toHaveLength(2);
+  expect(runtime.observed[0]?.input.fingerprint.value).not.toBe(
+    runtime.observed[1]?.input.fingerprint.value,
+  );
+
+  const write = runtime.session.getToolDefinition("write");
+  if (!write) throw new Error("locked write tool missing");
+  await write.execute(
+    call.id,
+    call.arguments,
+    undefined,
+    undefined,
+    undefined as never,
+  );
+  expect(await readFile(join(runtime.cwd, "changed.txt"), "utf8")).toBe(
+    "second",
+  );
+});
+
+test("Pi 0.85.1 invalidates a saved pre-image after target drift and requires a fresh card", async () => {
+  const runtime = await createRuntime();
+  const targetPath = join(runtime.cwd, "drift.txt");
+  await writeFile(targetPath, "before", "utf8");
+  const ui = installApprovalUi(runtime, [
+    {
+      onOpen: () => writeFile(targetPath, "concurrent change", "utf8"),
+      inputs: ["down", "down", "enter"],
+    },
+    { inputs: ["down", "down", "enter"] },
+  ]);
+
+  expect(
+    await emitCall(runtime, {
+      id: "drift-write",
+      name: "write",
+      arguments: { path: "drift.txt", content: "planned" },
+    }),
+  ).toBeUndefined();
+  expect(ui.customCalls).toBe(2);
+  expect(runtime.observed).toHaveLength(2);
+  expect(runtime.observed[0]?.preImage.snapshotId).not.toBe(
+    runtime.observed[1]?.preImage.snapshotId,
+  );
+});
+
+test("Pi 0.85.1 exposes all five requested binding values and each changed value invalidates approval", async () => {
+  const runtime = await createRuntime();
+  await writeFile(join(runtime.cwd, "binding.txt"), "binding", "utf8");
+  expect(
+    await emitCall(runtime, {
+      id: "binding-read",
+      name: "read",
+      arguments: { path: "binding.txt" },
+    }),
+  ).toBeUndefined();
+  const facts = runtime.observed[0];
+  if (!facts) throw new Error("real Pi facts missing");
+  const approved = executionBinding(facts);
+  const changes: Partial<ExecutionBinding>[] = [
+    { fingerprint: { ...approved.fingerprint, value: "f".repeat(64) } },
+    { toolName: "edit" },
+    { cwd: join(runtime.cwd, "other") },
+    { sessionId: "session-two" },
+    { hostExecutionId: "different-execution" },
+  ];
+
+  expect(approved).toMatchObject({
+    toolName: "read",
+    cwd: runtime.cwd,
+    sessionId: "session-one",
+    hostExecutionId: expect.stringMatching(/^[a-f\d]{64}$/),
+  });
+  for (const change of changes) {
+    const token = issueApprovalToken(facts.action.actionId, approved);
+    expect(
+      consumeApprovalToken(token, facts.action.actionId, {
+        ...approved,
+        ...change,
+      }),
+    ).toBe(false);
+  }
+});
+
+test("Pi 0.85.1 keeps snapshot downgrade explicit while allowing a fresh TUI approval", async () => {
+  const runtime = await createRuntime({ snapshotUnavailable: true });
+  const ui = installApprovalUi(runtime, [
+    { inputs: ["down", "down", "enter"] },
+  ]);
+
+  expect(
+    await emitCall(runtime, {
+      id: "degraded-write",
+      name: "write",
+      arguments: { path: "degraded.txt", content: "approved" },
+    }),
+  ).toBeUndefined();
+  expect(runtime.observed[0]?.preImage).toMatchObject({
+    status: "unavailable",
+    canRestoreNow: false,
+    recoveryGrade: "unknown",
+  });
+  const copy = ui.rendered.flat().join("\n");
+  expect(copy).toContain("未能保存修改前证据");
+  expect(copy).toContain("当前不能自动恢复");
+  expect(copy).not.toMatch(/可以恢复|可撤销|Undo|回滚/u);
 });

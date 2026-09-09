@@ -75,6 +75,7 @@ test("the Alpha schema preserves unknown safety facts and exact identities", () 
       toolName: "unknown-tool",
       cwd: "C:/project",
       sessionId: "session-1",
+      hostExecutionId: "host-execution-1",
       toolCallId: "call-1",
     },
     state: "invalidated",

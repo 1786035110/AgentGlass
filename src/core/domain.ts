@@ -31,6 +31,7 @@ export interface ExecutionBinding {
   toolName: string;
   cwd: string;
   sessionId: string;
+  hostExecutionId: string;
   toolCallId: string;
 }
 
@@ -120,9 +121,9 @@ export interface OutcomeCard {
 }
 
 export interface ApprovalToken {
-  actionId: string;
-  binding: ExecutionBinding;
-  state: "issued" | "consumed" | "invalidated";
+  readonly actionId: string;
+  readonly binding: Readonly<ExecutionBinding>;
+  readonly state: "issued" | "consumed" | "invalidated";
 }
 
 export type SnapshotFailureCode =

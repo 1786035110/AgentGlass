@@ -243,14 +243,17 @@ function sameFile(
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-async function readBounded(targetPath: string): Promise<{
+async function readBounded(
+  targetPath: string,
+  limit = SNAPSHOT_FILE_LIMIT_BYTES,
+): Promise<{
   bytes: Buffer;
   stats: Awaited<ReturnType<typeof lstat>>;
 }> {
   const before = await lstat(targetPath);
   if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1)
     fail("SNAPSHOT_TARGET_UNSUPPORTED");
-  if (before.size > SNAPSHOT_FILE_LIMIT_BYTES) fail("SNAPSHOT_FILE_TOO_LARGE");
+  if (before.size > limit) fail("SNAPSHOT_FILE_TOO_LARGE");
 
   const flags =
     process.platform === "win32"
@@ -268,7 +271,7 @@ async function readBounded(targetPath: string): Promise<{
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
       if (bytesRead === 0) break;
       total += bytesRead;
-      if (total > SNAPSHOT_FILE_LIMIT_BYTES) fail("SNAPSHOT_FILE_TOO_LARGE");
+      if (total > limit) fail("SNAPSHOT_FILE_TOO_LARGE");
       chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
     }
     const after = await handle.stat();
@@ -504,5 +507,120 @@ export async function capturePreImageSnapshot(
       await lock.close().catch(() => {});
       await removePrivateFile(path.join(snapshotRoot, LOCK_NAME));
     }
+  }
+}
+
+export async function verifyPreImageSnapshotBaseline(
+  snapshotRoot: string | undefined,
+  snapshot: PreImageSnapshotEvidence,
+  expectedTarget: SensitiveSnapshotTarget,
+): Promise<boolean> {
+  if (
+    !snapshotRoot ||
+    snapshot.status !== "saved" ||
+    !snapshot.snapshotId ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      snapshot.snapshotId,
+    )
+  ) {
+    return false;
+  }
+
+  try {
+    const manifestPath = path.join(
+      snapshotRoot,
+      `${snapshot.snapshotId}.manifest.json`,
+    );
+    // manifest 也必须通过同一个 no-follow、身份稳定且有界的读取路径；不能在 lstat
+    // 与 readFile 之间给替换后的链接或超大文件留下无界读取窗口。
+    const { bytes } = await readBounded(manifestPath, MANIFEST_LIMIT_BYTES);
+    const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return false;
+    const manifest = parsed as SnapshotManifestV1;
+    if (
+      manifest.schemaVersion !== 1 ||
+      manifest.kind !== "agentglass-pre-image" ||
+      manifest.snapshotId !== snapshot.snapshotId ||
+      manifest.actionId !== expectedTarget.actionId ||
+      manifest.targetId !== expectedTarget.targetId ||
+      manifest.targetPath !== expectedTarget.targetPath ||
+      manifest.targetExisted !== expectedTarget.targetExisted ||
+      manifest.canRestoreNow !== false ||
+      manifest.recoveryGrade !== "unknown" ||
+      typeof manifest.targetExisted !== "boolean" ||
+      !path.isAbsolute(manifest.targetPath) ||
+      snapshot.targetExisted !== (manifest.targetExisted ? "yes" : "no")
+    ) {
+      return false;
+    }
+
+    if (!manifest.targetExisted) {
+      if (
+        manifest.preImage !== null ||
+        manifest.fileIdentity !== null ||
+        manifest.permissions !== null
+      ) {
+        return false;
+      }
+      return await targetStillMatches(expectedTarget);
+    }
+
+    if (
+      !manifest.preImage ||
+      !manifest.fileIdentity ||
+      !manifest.permissions ||
+      manifest.preImage.file !== `${snapshot.snapshotId}.preimage` ||
+      !Number.isSafeInteger(manifest.preImage.byteLength) ||
+      manifest.preImage.byteLength < 0 ||
+      manifest.preImage.byteLength > SNAPSHOT_FILE_LIMIT_BYTES ||
+      !/^[0-9a-f]{64}$/u.test(manifest.preImage.sha256) ||
+      typeof manifest.fileIdentity.device !== "string" ||
+      typeof manifest.fileIdentity.inode !== "string" ||
+      manifest.permissions.platform !== process.platform ||
+      !Number.isSafeInteger(manifest.permissions.mode) ||
+      typeof manifest.permissions.uid !== "string" ||
+      typeof manifest.permissions.gid !== "string" ||
+      (manifest.permissions.acl !== null &&
+        (manifest.permissions.acl.format !== "sddl" ||
+          typeof manifest.permissions.acl.value !== "string")) ||
+      (process.platform === "win32") !== (manifest.permissions.acl !== null)
+    ) {
+      return false;
+    }
+
+    const captured = await readBounded(expectedTarget.targetPath);
+    const saved = await readBounded(
+      path.join(snapshotRoot, manifest.preImage.file),
+    );
+    const currentHash = createHash("sha256")
+      .update(captured.bytes)
+      .digest("hex");
+    const savedHash = createHash("sha256").update(saved.bytes).digest("hex");
+    const currentAcl =
+      manifest.permissions.acl?.format === "sddl" &&
+      process.platform === "win32"
+        ? await readWindowsTargetAcl(manifest.targetPath)
+        : null;
+    return (
+      captured.stats.isFile() &&
+      captured.stats.nlink === 1 &&
+      saved.stats.isFile() &&
+      saved.stats.nlink === 1 &&
+      captured.bytes.length === manifest.preImage.byteLength &&
+      saved.bytes.length === manifest.preImage.byteLength &&
+      String(captured.stats.dev) === manifest.fileIdentity.device &&
+      String(captured.stats.ino) === manifest.fileIdentity.inode &&
+      (Number(captured.stats.mode) & 0o7777) === manifest.permissions.mode &&
+      String(captured.stats.uid) === manifest.permissions.uid &&
+      String(captured.stats.gid) === manifest.permissions.gid &&
+      currentHash === manifest.preImage.sha256 &&
+      savedHash === manifest.preImage.sha256 &&
+      (manifest.permissions.acl === null ||
+        currentAcl === manifest.permissions.acl.value)
+    );
+  } catch {
+    // 快照域缺失、损坏、未来版本或读取失败都不能维持旧卡片的前像事实。
+    return false;
   }
 }
