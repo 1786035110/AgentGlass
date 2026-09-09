@@ -4,6 +4,7 @@ import type {
   RiskDecision,
   RiskLevel,
   RiskReasonCode,
+  TriState,
 } from "./domain.js";
 
 interface RiskRule {
@@ -258,6 +259,61 @@ function failClosed(reasonCode: "INPUT_INVALID" | "PREFLIGHT_FAILED") {
   });
 }
 
+function addBatchBlock(
+  risk: RiskAssessment,
+  reasonCode: "BATCH_MUTATION_BLOCKED" | "BATCH_CONTEXT_UNKNOWN",
+): RiskAssessment {
+  // sibling 缺失同时属于必需 preflight 失败；两个原因都保留，不能用 high batch 文案掩盖 critical 事实。
+  const reasonCodes = [...risk.reasonCodes];
+  if (
+    reasonCode === "BATCH_CONTEXT_UNKNOWN" &&
+    !reasonCodes.includes("PREFLIGHT_FAILED")
+  ) {
+    const afterIntegrity = reasonCodes.findIndex(
+      (code) => code !== "INPUT_INVALID" && code !== "INTEGRITY_FAILURE",
+    );
+    reasonCodes.splice(
+      afterIntegrity < 0 ? reasonCodes.length : afterIntegrity,
+      0,
+      "PREFLIGHT_FAILED",
+    );
+  }
+  const before = reasonCodes.findIndex((code) =>
+    [
+      "UNSUPPORTED_TOOL",
+      "SENSITIVE_TARGET",
+      "OUTSIDE_WORKSPACE",
+      "PATH_UNCERTAIN",
+      "FILE_MODIFY",
+      "FILE_CREATE",
+      "KNOWN_READ_ONLY",
+    ].includes(code),
+  );
+  reasonCodes.splice(before < 0 ? reasonCodes.length : before, 0, reasonCode);
+  return Object.freeze({
+    level:
+      reasonCode === "BATCH_CONTEXT_UNKNOWN"
+        ? "critical"
+        : levelPriority[risk.level] < levelPriority.high
+          ? "high"
+          : risk.level,
+    decision: "hard_block",
+    reasonCodes: Object.freeze(reasonCodes),
+  });
+}
+
+function mutationFact(action: ActionFacts): TriState {
+  const risk = assessRisk(action);
+  // 无效或自相矛盾的分类事实无法证明只读，按 unknown 计入 sibling mutation 数量。
+  if (
+    risk.reasonCodes.includes("INPUT_INVALID") ||
+    risk.reasonCodes.includes("PREFLIGHT_FAILED")
+  ) {
+    return "unknown";
+  }
+  return action.mutatesState;
+}
+
 export function assessRisk(action: ActionFacts): RiskAssessment {
   try {
     if (!isActionFacts(action)) return failClosed("INPUT_INVALID");
@@ -286,5 +342,56 @@ export function assessRisk(action: ActionFacts): RiskAssessment {
   } catch {
     // Proxy/getter 或规则执行异常都不能把未完成的判断降成 ask/auto_allow，也不泄漏异常文本。
     return failClosed("PREFLIGHT_FAILED");
+  }
+}
+
+export function assessSiblingMutationRisk(
+  current: ActionFacts,
+  siblings: readonly ActionFacts[] | undefined,
+): RiskAssessment {
+  // 每个 sibling 已在同一瞬时 preflight 中独立分类；这里只按 no / yes-or-unknown 计数。
+  // 两个及以上变更时只收紧变更成员，不按目标文件归因，也不排队或重排原调用。
+  const currentRisk = assessRisk(current);
+  try {
+    const currentMutation = mutationFact(current);
+    if (
+      !Array.isArray(siblings) ||
+      siblings.length === 0 ||
+      new Set(siblings.map((action) => action.actionId)).size !==
+        siblings.length ||
+      siblings.some((action) => {
+        const reasons = assessRisk(action).reasonCodes;
+        return (
+          reasons.includes("INPUT_INVALID") ||
+          reasons.includes("PREFLIGHT_FAILED")
+        );
+      })
+    ) {
+      return currentMutation === "no"
+        ? currentRisk
+        : addBatchBlock(currentRisk, "BATCH_CONTEXT_UNKNOWN");
+    }
+
+    const matches = siblings.filter(
+      (action) => action.actionId === current.actionId,
+    );
+    if (
+      matches.length !== 1 ||
+      matches[0]?.fingerprint.value !== current.fingerprint.value
+    ) {
+      return currentMutation === "no"
+        ? currentRisk
+        : addBatchBlock(currentRisk, "BATCH_CONTEXT_UNKNOWN");
+    }
+
+    const mutationCount = siblings.filter(
+      (action) => mutationFact(action) !== "no",
+    ).length;
+    return currentMutation !== "no" && mutationCount >= 2
+      ? addBatchBlock(currentRisk, "BATCH_MUTATION_BLOCKED")
+      : currentRisk;
+  } catch {
+    // sibling getter/Proxy 或聚合异常不能把当前变更降为普通 ask。
+    return addBatchBlock(currentRisk, "BATCH_CONTEXT_UNKNOWN");
   }
 }

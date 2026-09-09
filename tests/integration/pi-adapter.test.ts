@@ -126,6 +126,27 @@ async function emitCall(
   });
 }
 
+async function emitBatch(
+  runtime: Awaited<ReturnType<typeof createRuntime>>,
+  calls: Array<{
+    id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+  }>,
+) {
+  runtime.sessionManager.appendMessage(assistantMessage(calls));
+  return Promise.all(
+    calls.map((call) =>
+      runtime.session.extensionRunner.emitToolCall({
+        type: "tool_call",
+        toolCallId: call.id,
+        toolName: call.name,
+        input: call.arguments,
+      }),
+    ),
+  );
+}
+
 test("Pi 0.85.1 maps the current goal, current siblings, and real execution identities", async () => {
   const runtime = await createRuntime();
   runtime.sessionManager.appendMessage(
@@ -139,6 +160,7 @@ test("Pi 0.85.1 maps the current goal, current siblings, and real execution iden
     timestamp: Date.now(),
   });
   await setGoal(runtime, "读取当前说明");
+  await writeFile(join(runtime.cwd, "now.txt"), "now", "utf8");
   runtime.sessionManager.appendMessage(
     assistantMessage([
       { id: "current-read", name: "read", arguments: { path: "now.txt" } },
@@ -175,6 +197,117 @@ test("Pi 0.85.1 maps the current goal, current siblings, and real execution iden
     "old-call",
   );
   expect(facts?.siblings[0]?.hostExecutionId).toBe(facts?.hostExecutionId);
+});
+
+test("Pi 0.85.1 sibling guard blocks only mutation/unknown members when a batch has at least two", async () => {
+  const cases = [
+    {
+      name: "read + read",
+      calls: [
+        { id: "r1", name: "read", arguments: { path: "a.txt" } },
+        { id: "r2", name: "read", arguments: { path: "b.txt" } },
+      ],
+      blocked: [],
+    },
+    {
+      name: "read + write",
+      calls: [
+        { id: "r", name: "read", arguments: { path: "a.txt" } },
+        {
+          id: "w",
+          name: "write",
+          arguments: { path: "one.txt", content: "one" },
+        },
+      ],
+      blocked: [],
+    },
+    {
+      name: "write + write to different files",
+      calls: [
+        {
+          id: "w1",
+          name: "write",
+          arguments: { path: "one.txt", content: "one" },
+        },
+        {
+          id: "w2",
+          name: "write",
+          arguments: { path: "two.txt", content: "two" },
+        },
+      ],
+      blocked: ["w1", "w2"],
+    },
+    {
+      name: "write + unknown",
+      calls: [
+        {
+          id: "w",
+          name: "write",
+          arguments: { path: "one.txt", content: "one" },
+        },
+        { id: "u", name: "mystery", arguments: {} },
+      ],
+      blocked: ["w", "u"],
+    },
+    {
+      name: "unknown + unknown",
+      calls: [
+        { id: "u1", name: "mystery", arguments: {} },
+        { id: "u2", name: "other", arguments: {} },
+      ],
+      blocked: ["u1", "u2"],
+    },
+    {
+      name: "three siblings",
+      calls: [
+        { id: "r", name: "read", arguments: { path: "a.txt" } },
+        {
+          id: "w",
+          name: "write",
+          arguments: { path: "one.txt", content: "one" },
+        },
+        {
+          id: "e",
+          name: "edit",
+          arguments: {
+            path: "a.txt",
+            edits: [{ oldText: "a", newText: "b" }],
+          },
+        },
+      ],
+      blocked: ["w", "e"],
+    },
+  ] as const;
+
+  for (const fixture of cases) {
+    const runtime = await createRuntime();
+    await Promise.all(
+      fixture.calls
+        .filter((call) => call.name === "read" || call.name === "edit")
+        .map((call) =>
+          writeFile(join(runtime.cwd, `${call.arguments.path}`), "a"),
+        ),
+    );
+    const results = await emitBatch(runtime, [...fixture.calls]);
+    const blockedBySiblingGuard = fixture.calls
+      .filter((_call, index) =>
+        results[index]?.reason?.includes("一次只提出一个变更"),
+      )
+      .map((call) => call.id);
+    expect(blockedBySiblingGuard, fixture.name).toEqual(fixture.blocked);
+    for (const result of results.filter((item) =>
+      item?.reason?.includes("一次只提出一个变更"),
+    )) {
+      expect(result?.reason).toContain("一次只提出一个变更");
+    }
+    if (fixture.name === "read + write") {
+      expect(results[0]).toBeUndefined();
+      expect(results[1]).toMatchObject({
+        block: true,
+        reason: expect.stringContaining("明确确认"),
+      });
+    }
+  }
 });
 
 test("Pi 0.85.1 verified read/write/edit identities use their locked schemas", async () => {
@@ -318,7 +451,7 @@ test("Pi 0.85.1 capability modes do not equate hasUI with safe approval", async 
 test("unknown and same-name overridden tools retain degraded identity", async () => {
   const unknown = await createRuntime();
   await setGoal(unknown, "unknown tool");
-  await emitCall(unknown, {
+  const unknownResult = await emitCall(unknown, {
     id: "unknown-call",
     name: "mystery",
     arguments: {},
@@ -327,6 +460,19 @@ test("unknown and same-name overridden tools retain degraded identity", async ()
     tool: { name: "mystery", status: "unknown" },
     evidenceCodes: ["TOOL_IDENTITY_UNKNOWN"],
   });
+  expect(unknownResult).toMatchObject({ block: true });
+
+  // Bash 分类结果不会进入文件工具 fast path；真实 Pi 生命周期中仍按 unsupported/unknown 阻止。
+  const bashResult = await emitCall(unknown, {
+    id: "bash-call",
+    name: "bash",
+    arguments: { command: "pwd" },
+  });
+  expect(unknown.observed.at(-1)).toMatchObject({
+    tool: { name: "bash" },
+    action: { kind: "unknown", mutatesState: "unknown" },
+  });
+  expect(bashResult).toMatchObject({ block: true });
 
   const overridden = await createRuntime({ overriddenRead: true });
   await setGoal(overridden, "overridden tool");
@@ -372,7 +518,10 @@ test("missing, duplicate, changed-session, and incomplete sibling identities fai
       toolName: "read",
       input: {},
     }),
-  ).toMatchObject({ block: true });
+  ).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("无法确认"),
+  });
 
   const staleSession = await createRuntime();
   staleSession.sessionManager.newSession({ id: "session-two" });
@@ -397,12 +546,70 @@ test("missing, duplicate, changed-session, and incomplete sibling identities fai
       toolName: "read",
       input: {},
     }),
-  ).toMatchObject({ block: true });
+  ).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("无法确认"),
+  });
+
+  const staleTurn = await createRuntime();
+  staleTurn.sessionManager.appendMessage(
+    assistantMessage([
+      { id: "old-write", name: "write", arguments: { path: "old.txt" } },
+    ]),
+  );
+  staleTurn.sessionManager.appendMessage({
+    role: "user",
+    content: "new turn",
+    timestamp: Date.now(),
+  });
+  staleTurn.sessionManager.appendMessage(
+    assistantMessage([
+      { id: "new-read", name: "read", arguments: { path: "new.txt" } },
+    ]),
+  );
+  expect(
+    await staleTurn.session.extensionRunner.emitToolCall({
+      type: "tool_call",
+      toolCallId: "old-write",
+      toolName: "write",
+      input: { path: "old.txt", content: "old" },
+    }),
+  ).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("无法确认"),
+  });
+
+  const unprovable = await createRuntime();
+  unprovable.sessionManager.appendMessage({
+    ...assistantMessage([
+      { id: "current-write", name: "write", arguments: {} },
+    ]),
+    content: [
+      {
+        type: "toolCall",
+        id: "current-write",
+        name: "write",
+        arguments: null,
+      },
+    ],
+  } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+  expect(
+    await unprovable.session.extensionRunner.emitToolCall({
+      type: "tool_call",
+      toolCallId: "current-write",
+      toolName: "write",
+      input: { path: "new.txt", content: "new" },
+    }),
+  ).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("无法确认"),
+  });
 });
 
 test("active execution and goal state are cleaned up by Pi lifecycle events", async () => {
   const runtime = await createRuntime();
   await setGoal(runtime, "first goal");
+  await writeFile(join(runtime.cwd, "note.txt"), "note", "utf8");
   const call = { id: "reused", name: "read", arguments: { path: "note.txt" } };
   expect(await emitCall(runtime, call)).toBeUndefined();
   const firstExecutionId = runtime.observed[0]?.hostExecutionId;
@@ -471,15 +678,20 @@ test("raw tool and goal secrets never enter observable or blocked adapter output
   const runtime = await createRuntime();
   const secret = "token=synthetic-adapter-credential";
   await setGoal(runtime, `保存 ${secret}`);
-  await emitCall(runtime, {
-    id: "secret-call",
-    name: "write",
-    arguments: { path: "note.txt", content: secret },
-  });
-  const serialized = JSON.stringify(runtime.observed[0]);
+  await writeFile(join(runtime.cwd, "note.txt"), "note", "utf8");
+  const results = await emitBatch(runtime, [
+    { id: "sibling-read", name: "read", arguments: { path: "note.txt" } },
+    {
+      id: "secret-call",
+      name: "write",
+      arguments: { path: "new.txt", content: secret },
+    },
+  ]);
+  const serialized = JSON.stringify(runtime.observed);
   expect(serialized).not.toContain(secret);
   expect(serialized).not.toContain("rawInput");
   expect(serialized).not.toContain('"canonical":');
+  expect(JSON.stringify(results)).not.toContain(secret);
 
   const blocked = await runtime.session.extensionRunner.emitToolCall({
     type: "tool_call",

@@ -1,6 +1,9 @@
 import { expect, test } from "vitest";
 import type { ActionFacts } from "../../src/core/domain.js";
-import { assessRisk } from "../../src/core/risk-engine.js";
+import {
+  assessRisk,
+  assessSiblingMutationRisk,
+} from "../../src/core/risk-engine.js";
 import { actionFacts } from "../fixtures/action-facts.js";
 
 test("INV-002/003: unknown mutation or effect has zero auto-allow", () => {
@@ -113,9 +116,6 @@ test("INV-003/020: missing verified identity or schema evidence cannot ask or au
   ].map((evidenceCodes) =>
     assessRisk(
       actionFacts({
-        kind: "edit",
-        mutatesState: "yes",
-        impactFacts: { effect: "edit", createsParentDirectories: "no" },
         evidenceCodes,
       }),
     ),
@@ -154,4 +154,75 @@ test("INV-003: an internal property failure fails closed without exposing the ex
     decision: "hard_block",
     reasonCodes: ["PREFLIGHT_FAILED"],
   });
+});
+
+test("INV-013/020: sibling mutation guard treats yes and unknown as changes without attribution exceptions", () => {
+  const read = actionFacts({ actionId: "read" });
+  const write = actionFacts({
+    actionId: "write",
+    kind: "write",
+    mutatesState: "yes",
+    impactFacts: { effect: "overwrite", createsParentDirectories: "no" },
+  });
+  const writeElsewhere = actionFacts({
+    actionId: "write-elsewhere",
+    kind: "write",
+    targetLabel: "other.txt",
+    mutatesState: "yes",
+    impactFacts: { effect: "overwrite", createsParentDirectories: "no" },
+  });
+  const unknown = actionFacts({
+    actionId: "unknown",
+    kind: "unknown",
+    mutatesState: "unknown",
+    impactFacts: { effect: "unknown", createsParentDirectories: "unknown" },
+  });
+
+  expect(assessSiblingMutationRisk(read, [read, write]).decision).toBe(
+    "auto_allow",
+  );
+  expect(assessSiblingMutationRisk(write, [read, write]).decision).toBe("ask");
+  for (const batch of [
+    [write, writeElsewhere],
+    [write, unknown],
+    [unknown, write],
+    [unknown, actionFacts({ actionId: "unknown-2", mutatesState: "unknown" })],
+    [read, write, writeElsewhere],
+  ]) {
+    for (const current of batch.filter(
+      (action) => action.mutatesState !== "no",
+    )) {
+      expect(assessSiblingMutationRisk(current, batch)).toMatchObject({
+        decision: "hard_block",
+        reasonCodes: expect.arrayContaining(["BATCH_MUTATION_BLOCKED"]),
+      });
+    }
+  }
+});
+
+test("INV-003/013/020: incomplete, duplicate, stale, and invalid sibling facts fail closed for a mutation", () => {
+  const write = actionFacts({
+    actionId: "write",
+    kind: "write",
+    mutatesState: "yes",
+    impactFacts: { effect: "overwrite", createsParentDirectories: "no" },
+  });
+  const incomplete = [
+    undefined,
+    [],
+    [write, write],
+    [actionFacts({ actionId: "old-turn" })],
+    [write, {} as ActionFacts],
+  ] as const;
+
+  for (const siblings of incomplete) {
+    expect(assessSiblingMutationRisk(write, siblings)).toMatchObject({
+      level: "critical",
+      decision: "hard_block",
+      reasonCodes: expect.arrayContaining([
+        "PREFLIGHT_FAILED",
+        "BATCH_CONTEXT_UNKNOWN",
+      ]),
+    });
+  }
 });

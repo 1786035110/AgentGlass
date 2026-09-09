@@ -53,6 +53,11 @@ test("the Alpha schema preserves unknown safety facts and exact identities", () 
     targetId: "target-1",
     kind: "unknown",
     targetLabel: action.targetLabel,
+    certainty: "unknown",
+    scope: "unknown",
+    purpose: "unknown",
+    applicationOutcome: "unverifiable",
+    evidenceCodes: ["ACTION_UNKNOWN"],
     descriptionKey: "effect.unknown",
   };
   const card: OutcomeCard = {

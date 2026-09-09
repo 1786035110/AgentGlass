@@ -17,11 +17,23 @@ import {
   projectHostExecutionInput,
   projectObservableUserGoal,
 } from "../../core/execution-input.js";
+import { assessSiblingMutationRisk } from "../../core/risk-engine.js";
 
 type AdapterObserver = (facts: HostExecutionFacts) => Promise<void> | void;
 
 const BLOCK_REASON =
   "AgentGlass could not verify this tool call's runtime identity, so it was stopped.";
+const MULTIPLE_MUTATIONS_REASON =
+  "已停止：这次包含多个会改变内容或影响未知的操作。请让 Pi 一次只提出一个变更。";
+const BATCH_CONTEXT_REASON =
+  "已停止：无法确认这次同时提出的操作是否完整。请让 Pi 一次只提出一个变更后重试。";
+const APPROVAL_UNAVAILABLE_REASON =
+  "已停止：这一步需要明确确认，但当前阶段尚未提供审批界面。";
+const SAFETY_BLOCK_REASON =
+  "已停止：当前版本无法可靠说明或支持这一步。请改为普通项目文件的查看或单个修改。";
+
+// 仅区分“批次无法证明”和其他宿主身份失败，以选择真实且脱敏的固定原因；异常文本从不返回 Pi。
+class SiblingContextError extends Error {}
 
 const knownBuiltinNames = new Set([
   "read",
@@ -117,6 +129,7 @@ function mapToolIdentity(
 function currentSiblingCalls(ctx: ExtensionContext): Array<{
   id: string;
   name: string;
+  arguments: Record<string, unknown>;
 }> {
   const leaf = ctx.sessionManager.getLeafEntry();
   if (
@@ -124,10 +137,14 @@ function currentSiblingCalls(ctx: ExtensionContext): Array<{
     leaf.message.role !== "assistant" ||
     !Array.isArray(leaf.message.content)
   ) {
-    throw new Error();
+    throw new SiblingContextError();
   }
 
-  const calls: Array<{ id: string; name: string }> = [];
+  const calls: Array<{
+    id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+  }> = [];
   for (const item of leaf.message.content) {
     if (!item || typeof item !== "object" || item.type !== "toolCall") continue;
     if (
@@ -137,15 +154,19 @@ function currentSiblingCalls(ctx: ExtensionContext): Array<{
       typeof item.arguments !== "object" ||
       Array.isArray(item.arguments)
     ) {
-      throw new Error();
+      throw new SiblingContextError();
     }
-    calls.push({ id: item.id, name: item.name });
+    calls.push({
+      id: item.id,
+      name: item.name,
+      arguments: item.arguments as Record<string, unknown>,
+    });
   }
   if (
     calls.length === 0 ||
     new Set(calls.map((call) => call.id)).size !== calls.length
   ) {
-    throw new Error();
+    throw new SiblingContextError();
   }
   return calls;
 }
@@ -167,7 +188,7 @@ function mapToolCall(
   expectedSessionId: string | undefined,
   activeExecutions: ReadonlyMap<string, string>,
   userGoal: ObservableUserGoal,
-): TransientHostExecutionInput {
+): readonly TransientHostExecutionInput[] {
   if (!nonEmptyString(event.toolCallId)) {
     throw new Error();
   }
@@ -200,29 +221,34 @@ function mapToolCall(
     (call) => call.id === event.toolCallId && call.name === event.toolName,
   );
   if (currentMatches.length !== 1) {
-    throw new Error();
+    throw new SiblingContextError();
   }
 
-  return {
-    hostExecutionId: hostExecutionId(sessionId, event.toolCallId),
-    toolCallId: event.toolCallId,
-    sessionId,
-    cwd: ctx.cwd,
-    tool: mapToolIdentity(event.toolName, tools),
-    capabilities: mapPiCapabilities(ctx.mode, ctx.hasUI),
-    siblings: Object.freeze(
-      siblings.map(
-        (call): SiblingExecutionReference =>
-          Object.freeze({
-            hostExecutionId: hostExecutionId(sessionId, call.id),
-            toolCallId: call.id,
-            tool: mapToolIdentity(call.name, tools),
-          }),
-      ),
+  const references = Object.freeze(
+    siblings.map(
+      (call): SiblingExecutionReference =>
+        Object.freeze({
+          hostExecutionId: hostExecutionId(sessionId, call.id),
+          toolCallId: call.id,
+          tool: mapToolIdentity(call.name, tools),
+        }),
     ),
-    userGoal,
-    rawInput: event.input,
-  };
+  );
+
+  // sibling raw input 仅供本次 preflight 分类；当前调用采用事件里的有效 input，避免使用旧消息副本。
+  return Object.freeze(
+    siblings.map((call) => ({
+      hostExecutionId: hostExecutionId(sessionId, call.id),
+      toolCallId: call.id,
+      sessionId,
+      cwd: ctx.cwd,
+      tool: mapToolIdentity(call.name, tools),
+      capabilities: mapPiCapabilities(ctx.mode, ctx.hasUI),
+      siblings: references,
+      userGoal,
+      rawInput: call.id === event.toolCallId ? event.input : call.arguments,
+    })),
+  );
 }
 
 export function registerPiAdapter(
@@ -259,9 +285,9 @@ export function registerPiAdapter(
     }
   });
   pi.on("tool_call", (event, ctx) => {
-    let transient: TransientHostExecutionInput;
+    let batch: readonly TransientHostExecutionInput[];
     try {
-      transient = mapToolCall(
+      batch = mapToolCall(
         pi,
         event,
         ctx,
@@ -269,17 +295,53 @@ export function registerPiAdapter(
         activeExecutions,
         userGoal,
       );
-      activeExecutions.set(event.toolCallId, transient.hostExecutionId);
-    } catch {
-      return { block: true, reason: BLOCK_REASON };
+      const current = batch.find(
+        (item) => item.toolCallId === event.toolCallId,
+      );
+      if (!current) throw new Error();
+      activeExecutions.set(event.toolCallId, current.hostExecutionId);
+    } catch (error) {
+      return {
+        block: true,
+        reason:
+          error instanceof SiblingContextError
+            ? BATCH_CONTEXT_REASON
+            : BLOCK_REASON,
+      };
     }
 
     const toolCallId = event.toolCallId;
-    // 文件真实路径检查是异步的；raw input 只活到本 Promise 完成，observer 只接收脱敏 facts。
-    return projectHostExecutionInput(transient)
-      .then((facts) => observe(facts))
+    // 整批路径检查并行完成；raw input 只活到本 Promise，observer 仍只接收当前动作的脱敏 facts。
+    return Promise.all(batch.map(projectHostExecutionInput))
+      .then(async (facts) => {
+        const current = facts.find((item) => item.toolCallId === toolCallId);
+        if (!current) throw new Error();
+        await observe(current);
+        const risk = assessSiblingMutationRisk(
+          current.action,
+          facts.map((item) => item.action),
+        );
+        if (risk.reasonCodes.includes("BATCH_MUTATION_BLOCKED")) {
+          activeExecutions.delete(toolCallId);
+          return { block: true as const, reason: MULTIPLE_MUTATIONS_REASON };
+        }
+        if (risk.reasonCodes.includes("BATCH_CONTEXT_UNKNOWN")) {
+          activeExecutions.delete(toolCallId);
+          return { block: true as const, reason: BATCH_CONTEXT_REASON };
+        }
+        // A-008 不提前实现审批 UI；在 A-011/A-012 闭环前，只有完整检查后的 auto_allow 可以交回 Pi 执行。
+        if (risk.decision === "auto_allow") return undefined;
+        activeExecutions.delete(toolCallId);
+        return {
+          block: true as const,
+          reason:
+            risk.decision === "ask"
+              ? APPROVAL_UNAVAILABLE_REASON
+              : SAFETY_BLOCK_REASON,
+        };
+      })
       .then(
-        () => undefined,
+        (result) => result,
         () => {
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: BLOCK_REASON };

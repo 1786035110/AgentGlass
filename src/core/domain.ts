@@ -2,12 +2,14 @@
 export type TriState = "yes" | "no" | "unknown";
 export type RiskLevel = "info" | "high" | "critical";
 export type RiskDecision = "auto_allow" | "ask" | "hard_block";
-// A-007 的原因码是稳定领域值；展示层只能翻译，不能增删它们来改变决策。
+// Alpha 风险原因码是稳定领域值；展示层只能翻译，不能增删它们来改变决策。
 export type RiskReasonCode =
   | "INPUT_INVALID"
   | "INTEGRITY_FAILURE"
   | "PREFLIGHT_FAILED"
   | "SAFETY_CONTROL_MUTATION"
+  | "BATCH_MUTATION_BLOCKED"
+  | "BATCH_CONTEXT_UNKNOWN"
   | "UNSUPPORTED_TOOL"
   | "SENSITIVE_TARGET"
   | "OUTSIDE_WORKSPACE"
@@ -82,11 +84,29 @@ export interface RiskAssessment {
   reasonCodes: readonly RiskReasonCode[];
 }
 
+export type PredictedEffectKind =
+  | "read"
+  | "create"
+  | "modify"
+  | "overwrite"
+  | "install"
+  | "network"
+  | "process"
+  | "unsupported_shell"
+  | "unknown_command"
+  | "unknown";
+
+// 预测只描述确定性事实能够支持的工具意图；它不表示动作已经执行，也不证明应用功能正确。
 export interface PredictedEffect {
   effectId: string;
   targetId: string;
-  kind: "read" | "create" | "modify" | "unknown";
+  kind: PredictedEffectKind;
   targetLabel: string;
+  certainty: "known" | "unknown";
+  scope: "bounded" | "limited" | "unknown";
+  purpose: "unknown";
+  applicationOutcome: "unverifiable";
+  evidenceCodes: readonly string[];
   descriptionKey: string;
 }
 

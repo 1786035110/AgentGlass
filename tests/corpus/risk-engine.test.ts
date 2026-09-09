@@ -8,7 +8,10 @@ import type {
   RiskReasonCode,
 } from "../../src/core/domain.js";
 import { classifyFileAction } from "../../src/core/file-classification.js";
-import { assessRisk } from "../../src/core/risk-engine.js";
+import {
+  assessRisk,
+  assessSiblingMutationRisk,
+} from "../../src/core/risk-engine.js";
 import { actionFacts } from "../fixtures/action-facts.js";
 
 const temporaryDirectories: string[] = [];
@@ -156,6 +159,11 @@ test("A-007 consumes real file-classifier facts without widening support", async
     ).decision,
     assessRisk(await classify("read", { path: ".env" })).decision,
     assessRisk(await classify("read", { path: "missing.txt" })).decision,
+    assessRisk(
+      await classify("read", {
+        path: path.join(workspace, "..", "outside.txt"),
+      }),
+    ).decision,
   ];
 
   expect(decisions).toEqual([
@@ -164,5 +172,37 @@ test("A-007 consumes real file-classifier facts without widening support", async
     "ask",
     "hard_block",
     "hard_block",
+    "hard_block",
   ]);
+});
+
+test("A-008 batch rules each have a hit and neighboring non-hit", () => {
+  const read = actionFacts({ actionId: "read" });
+  const write = actionFacts({
+    actionId: "write",
+    kind: "write",
+    mutatesState: "yes",
+    impactFacts: { effect: "overwrite", createsParentDirectories: "no" },
+  });
+  const otherWrite = actionFacts({
+    actionId: "other-write",
+    kind: "write",
+    mutatesState: "yes",
+    impactFacts: { effect: "overwrite", createsParentDirectories: "no" },
+  });
+
+  expect(
+    assessSiblingMutationRisk(write, [read, write]).reasonCodes,
+  ).not.toContain("BATCH_MUTATION_BLOCKED");
+  expect(
+    assessSiblingMutationRisk(write, [write, otherWrite]).reasonCodes,
+  ).toContain("BATCH_MUTATION_BLOCKED");
+  expect(assessSiblingMutationRisk(write, [write]).reasonCodes).not.toContain(
+    "BATCH_CONTEXT_UNKNOWN",
+  );
+  expect(assessSiblingMutationRisk(write, undefined)).toEqual({
+    level: "critical",
+    decision: "hard_block",
+    reasonCodes: ["PREFLIGHT_FAILED", "BATCH_CONTEXT_UNKNOWN", "FILE_MODIFY"],
+  });
 });
