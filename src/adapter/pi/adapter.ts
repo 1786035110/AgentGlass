@@ -17,6 +17,11 @@ import {
   projectHostExecutionInput,
   projectObservableUserGoal,
 } from "../../core/execution-input.js";
+import { resolveSensitiveSnapshotTarget } from "../../core/file-classification.js";
+import {
+  capturePreImageSnapshot,
+  unavailablePreImageSnapshot,
+} from "../../core/pre-image-snapshot.js";
 import { assessSiblingMutationRisk } from "../../core/risk-engine.js";
 
 type AdapterObserver = (facts: HostExecutionFacts) => Promise<void> | void;
@@ -254,6 +259,7 @@ function mapToolCall(
 export function registerPiAdapter(
   pi: ExtensionAPI,
   observe: AdapterObserver = () => {},
+  snapshotRoot?: string,
 ): void {
   let sessionId: string | undefined;
   let userGoal: ObservableUserGoal = Object.freeze({ status: "unknown" });
@@ -316,11 +322,38 @@ export function registerPiAdapter(
       .then(async (facts) => {
         const current = facts.find((item) => item.toolCallId === toolCallId);
         if (!current) throw new Error();
-        await observe(current);
         const risk = assessSiblingMutationRisk(
           current.action,
           facts.map((item) => item.action),
         );
+        let observed = current;
+        if (risk.decision === "ask") {
+          try {
+            const transient = batch.find(
+              (item) => item.toolCallId === toolCallId,
+            );
+            const target = transient
+              ? await resolveSensitiveSnapshotTarget({
+                  cwd: transient.cwd,
+                  tool: transient.tool,
+                  rawInput: transient.rawInput,
+                  expectedAction: current.action,
+                })
+              : undefined;
+            observed = Object.freeze({
+              ...current,
+              preImage: target
+                ? await capturePreImageSnapshot(snapshotRoot, target)
+                : unavailablePreImageSnapshot("SNAPSHOT_TARGET_UNSUPPORTED"),
+            });
+          } catch {
+            observed = Object.freeze({
+              ...current,
+              preImage: unavailablePreImageSnapshot("SNAPSHOT_TARGET_CHANGED"),
+            });
+          }
+        }
+        await observe(observed);
         if (risk.reasonCodes.includes("BATCH_MUTATION_BLOCKED")) {
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: MULTIPLE_MUTATIONS_REASON };

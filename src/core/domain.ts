@@ -125,6 +125,29 @@ export interface ApprovalToken {
   state: "issued" | "consumed" | "invalidated";
 }
 
+export type SnapshotFailureCode =
+  | "SNAPSHOT_STORAGE_UNAVAILABLE"
+  | "SNAPSHOT_STORAGE_UNSAFE"
+  | "SNAPSHOT_STORAGE_BUSY"
+  | "SNAPSHOT_TARGET_UNSUPPORTED"
+  | "SNAPSHOT_TARGET_CHANGED"
+  | "SNAPSHOT_FILE_TOO_LARGE"
+  | "SNAPSHOT_RESOURCE_LIMIT"
+  | "SNAPSHOT_PERMISSION_DENIED"
+  | "SNAPSHOT_PUBLISH_FAILED";
+
+// 普通 preflight 只接收不透明快照身份和降级事实。真实路径、原字节、权限值与 manifest
+// 始终留在敏感快照域；Alpha 即使成功保存前像也没有执行后基线或 restore 实现。
+export type PreImageSnapshotEvidence = Readonly<{
+  status: "not_applicable" | "saved" | "unavailable";
+  snapshotId: string | null;
+  targetExisted: TriState;
+  permissionMetadata: "captured" | "not_applicable" | "unknown";
+  failureCode: SnapshotFailureCode | null;
+  canRestoreNow: false;
+  recoveryGrade: "unknown";
+}>;
+
 // Alpha 阶段只保留后续验证器进行关联所需的标识符。
 export type VerificationCorrelation = Readonly<
   Pick<ActionFacts, "actionId"> & Pick<PredictedEffect, "effectId" | "targetId">
@@ -198,6 +221,7 @@ export interface HostExecutionFacts {
   userGoal: ObservableUserGoal;
   input: ProjectedActionInput;
   action: ActionFacts;
+  preImage: PreImageSnapshotEvidence;
   evidenceCodes: readonly string[];
 }
 

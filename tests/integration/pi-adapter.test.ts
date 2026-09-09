@@ -63,9 +63,13 @@ async function createRuntime(options?: { overriddenRead?: boolean }) {
       {
         name: "agentglass-integration",
         factory: (pi) =>
-          registerPiAdapter(pi, (facts) => {
-            observed.push(facts);
-          }),
+          registerPiAdapter(
+            pi,
+            (facts) => {
+              observed.push(facts);
+            },
+            join(cwd, ".agentglass", "snapshots"),
+          ),
       },
     ],
     noExtensions: true,
@@ -380,7 +384,11 @@ test("Pi 0.85.1 verified read/write/edit identities use their locked schemas", a
   }
 
   expect(
-    runtime.observed.map(({ tool, action }) => ({ tool, action })),
+    runtime.observed.map(({ tool, action, preImage }) => ({
+      tool,
+      action,
+      preImage,
+    })),
   ).toMatchObject([
     {
       tool: { name: "read", status: "verified_builtin" },
@@ -397,6 +405,12 @@ test("Pi 0.85.1 verified read/write/edit identities use their locked schemas", a
         mutatesState: "yes",
         impactFacts: { effect: "create" },
       },
+      preImage: {
+        status: "saved",
+        targetExisted: "no",
+        canRestoreNow: false,
+        recoveryGrade: "unknown",
+      },
     },
     {
       tool: { name: "edit", status: "verified_builtin" },
@@ -404,6 +418,13 @@ test("Pi 0.85.1 verified read/write/edit identities use their locked schemas", a
         kind: "edit",
         mutatesState: "yes",
         impactFacts: { effect: "edit" },
+      },
+      preImage: {
+        status: "saved",
+        targetExisted: "yes",
+        permissionMetadata: "captured",
+        canRestoreNow: false,
+        recoveryGrade: "unknown",
       },
     },
   ]);

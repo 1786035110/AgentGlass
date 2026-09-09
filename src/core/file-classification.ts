@@ -17,6 +17,7 @@ import {
   InputBoundaryError,
   projectTransientActionInput,
 } from "./input-boundary.js";
+import type { SensitiveSnapshotTarget } from "./pre-image-snapshot.js";
 
 const supportedTools = new Set(["read", "write", "edit"]);
 
@@ -540,5 +541,58 @@ export async function classifyFileAction(options: {
       fingerprint: projected.fingerprint,
     }),
     input: projected,
+  });
+}
+
+export async function resolveSensitiveSnapshotTarget(options: {
+  cwd: string;
+  tool: HostToolIdentity;
+  rawInput: unknown;
+  expectedAction: ActionFacts;
+}): Promise<SensitiveSnapshotTarget | undefined> {
+  // snapshot 在 sibling/risk 检查后才调用，因此这里重新绑定 raw input 与路径事实；异步检查期间
+  // 任一输入、存在状态、目标身份或支持性变化都会降级，不能把旧分类与新前像拼接。
+  const before = fingerprintTransientActionInput(
+    options.tool.name,
+    options.rawInput,
+  );
+  if (before.value !== options.expectedAction.fingerprint.value)
+    return undefined;
+  const parsed = parseVerifiedInput(options.tool, options.rawInput);
+  if (!parsed || (parsed.kind !== "write" && parsed.kind !== "edit"))
+    return undefined;
+  const pathFacts = await inspectPath(options.cwd, parsed.path);
+  const after = fingerprintTransientActionInput(
+    options.tool.name,
+    options.rawInput,
+  );
+  const target = options.expectedAction.targets[0];
+  const state =
+    parsed.kind === "write" && pathFacts.state === "missing"
+      ? "new_file"
+      : pathFacts.state;
+  const eligible =
+    before.value === after.value &&
+    options.expectedAction.kind === parsed.kind &&
+    options.expectedAction.sensitive === "no" &&
+    options.expectedAction.mutatesState === "yes" &&
+    options.expectedAction.impactFacts.createsParentDirectories === "no" &&
+    pathFacts.canonicalTarget !== undefined &&
+    pathFacts.scope === "inside" &&
+    pathFacts.linked === "no" &&
+    pathFacts.supported === "yes" &&
+    target?.targetId === opaqueTargetId(pathFacts.canonicalTarget) &&
+    target.state === state &&
+    target.supportedPath === "yes" &&
+    ((parsed.kind === "edit" && state === "existing_file") ||
+      (parsed.kind === "write" &&
+        (state === "existing_file" || state === "new_file")));
+  if (!eligible || !pathFacts.canonicalTarget) return undefined;
+
+  return Object.freeze({
+    actionId: options.expectedAction.actionId,
+    targetId: target.targetId,
+    targetPath: pathFacts.canonicalTarget,
+    targetExisted: state === "existing_file",
   });
 }

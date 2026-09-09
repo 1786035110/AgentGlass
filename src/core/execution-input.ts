@@ -5,6 +5,7 @@ import type {
 } from "./domain.js";
 import { classifyFileAction } from "./file-classification.js";
 import { projectTransientActionInput } from "./input-boundary.js";
+import { noPreImageSnapshot } from "./pre-image-snapshot.js";
 
 export function projectObservableUserGoal(prompt: string): ObservableUserGoal {
   // 目标原文不参与后续安全判断，因此在 Pi 生命周期事件到达时立即脱敏，不能跨事件保存原文。
@@ -48,6 +49,7 @@ export async function projectHostExecutionInput(
     userGoal: transient.userGoal,
     input,
     action,
+    preImage: noPreImageSnapshot(),
     evidenceCodes: Object.freeze(evidenceCodes),
   });
 }
