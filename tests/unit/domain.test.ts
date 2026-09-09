@@ -46,7 +46,7 @@ test("the Alpha schema preserves unknown safety facts and exact identities", () 
   const risk: RiskAssessment = {
     level: "critical",
     decision: "hard_block",
-    reasonCodes: ["ACTION_UNKNOWN"],
+    reasonCodes: ["UNSUPPORTED_TOOL"],
   };
   const effect: PredictedEffect = {
     effectId: "effect-1",

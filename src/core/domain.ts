@@ -2,6 +2,19 @@
 export type TriState = "yes" | "no" | "unknown";
 export type RiskLevel = "info" | "high" | "critical";
 export type RiskDecision = "auto_allow" | "ask" | "hard_block";
+// A-007 的原因码是稳定领域值；展示层只能翻译，不能增删它们来改变决策。
+export type RiskReasonCode =
+  | "INPUT_INVALID"
+  | "INTEGRITY_FAILURE"
+  | "PREFLIGHT_FAILED"
+  | "SAFETY_CONTROL_MUTATION"
+  | "UNSUPPORTED_TOOL"
+  | "SENSITIVE_TARGET"
+  | "OUTSIDE_WORKSPACE"
+  | "PATH_UNCERTAIN"
+  | "FILE_MODIFY"
+  | "FILE_CREATE"
+  | "KNOWN_READ_ONLY";
 
 // 指纹绑定经过版本化的规范化输入，审批时不能用脱敏后的展示数据替代它。
 export interface ActionFingerprint {
@@ -66,7 +79,7 @@ export type NormalizedAction = ActionFacts;
 export interface RiskAssessment {
   level: RiskLevel;
   decision: RiskDecision;
-  reasonCodes: string[];
+  reasonCodes: readonly RiskReasonCode[];
 }
 
 export interface PredictedEffect {
