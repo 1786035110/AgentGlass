@@ -82,6 +82,10 @@ test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", asy
 }, 30_000);
 
 test("A-015 Windows CI pins official actions and runs every existing gate in order", async () => {
+  // Windows runner 默认可能启用 autocrlf；仓库级属性必须让全新 checkout 保持 Biome 要求的 LF。
+  expect(await readFile(join(root, ".gitattributes"), "utf8")).toBe(
+    "* text=auto eol=lf\n",
+  );
   const workflow = await readFile(
     join(root, ".github", "workflows", "windows-ci.yml"),
     "utf8",
