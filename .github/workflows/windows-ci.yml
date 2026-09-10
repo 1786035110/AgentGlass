@@ -28,3 +28,5 @@ jobs:
       - run: npm run test:corpus
       - run: npm run test:security
       - run: npm run test:integration
+      - run: npm run test:e2e
+      - run: npm pack --dry-run --json

@@ -81,7 +81,7 @@ test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", asy
   }
 }, 30_000);
 
-test("A-015 Windows CI pins official actions and runs every existing gate in order", async () => {
+test("Windows CI pins official actions and runs every Alpha gate in order", async () => {
   // Windows runner 默认可能启用 autocrlf；仓库级属性必须让全新 checkout 保持 Biome 要求的 LF。
   expect(await readFile(join(root, ".gitattributes"), "utf8")).toBe(
     "* text=auto eol=lf\n",
@@ -120,8 +120,10 @@ test("A-015 Windows CI pins official actions and runs every existing gate in ord
     "npm run test:corpus",
     "npm run test:security",
     "npm run test:integration",
+    "npm run test:e2e",
+    "npm pack --dry-run --json",
   ]);
   expect(workflow).not.toMatch(
-    /continue-on-error|\bmatrix\b|\bsecrets\.|test:e2e|npm publish|deploy/iu,
+    /continue-on-error|\bmatrix\b|\bsecrets\.|npm publish|deploy/iu,
   );
 });
