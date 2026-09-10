@@ -38,6 +38,18 @@ test("host-neutral source contains no Pi imports or semantics", async () => {
   expect(failures).toEqual([]);
 });
 
+test("INV-018: Alpha exposes only the Pi adapter", async () => {
+  const adapterRoot = fileURLToPath(
+    new URL("../../src/adapter", import.meta.url),
+  );
+  const entries = await readdir(adapterRoot, { withFileTypes: true });
+  const adapters = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+
+  expect(adapters).toEqual(["pi"]);
+});
+
 test.each([
   [
     'import { ExtensionAPI } from "@earendil-works/pi-coding-agent";',

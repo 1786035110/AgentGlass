@@ -25,11 +25,16 @@ function visibleCopy(name: string): string {
   ].join("\n");
 }
 
-test("INV-005/017: display copy removes controls and secrets without exposing technical identities", () => {
+test("INV-005/011/017: every card avoids secrets, protection claims, and hidden-reasoning claims", () => {
   const control = visibleCopy("terminal control sequence in label");
   const secret = visibleCopy("synthetic secret in label");
   const obscuredSecret = visibleCopy("control-obscured synthetic secret");
   const unknown = visibleCopy("unsupported or unknown action");
+  const allCards = outcomeCardFixtures
+    .map((fixture) => visibleCopy(fixture.name))
+    .join("\n");
+  const prohibitedClaim =
+    /fingerprint|session|chain[- ]of[- ]thought|隐藏(?:思维|推理)|(?:受到|由).{0,8}(?:sandbox|沙箱)(?:保护|隔离)|完整(?:的)? shell containment|(?:能够|可以|会)阻止恶意.*扩展/i;
 
   expect(control).toContain("报告.txt");
   expect(control.replaceAll("\n", "")).not.toMatch(/\p{Cc}/u);
@@ -40,7 +45,9 @@ test("INV-005/017: display copy removes controls and secrets without exposing te
   expect(unknown).not.toContain("technical-action-id-must-not-render");
   expect(unknown).not.toContain("technical-target-id-must-not-render");
   expect(unknown).not.toContain("TOOL_IDENTITY_UNVERIFIED");
-  expect(unknown).not.toMatch(/fingerprint|session|chain[- ]of[- ]thought/i);
+  expect(allCards).not.toMatch(prohibitedClaim);
+  expect("不能阻止恶意共存 Pi 扩展").not.toMatch(prohibitedClaim);
+  expect("可以阻止恶意共存 Pi 扩展").toMatch(prohibitedClaim);
 });
 
 test("INV-005: huge untrusted labels are bounded while fixed safety facts remain intact", () => {
