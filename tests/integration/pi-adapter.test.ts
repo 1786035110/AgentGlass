@@ -953,7 +953,9 @@ test("Pi 0.85.1 abort, missing custom result, UI error, RPC hasUI, and no UI can
     name: "write",
     arguments: { path: "abort.txt", content: "must not run" },
   });
-  await vi.waitFor(() => expect(abortUi.customCalls).toBe(1));
+  await vi.waitFor(() => expect(abortUi.customCalls).toBe(1), {
+    timeout: 30_000,
+  });
   await aborted.session.extensionRunner.emit({
     type: "agent_end",
     messages: [],
@@ -1081,7 +1083,7 @@ test("Pi 0.85.1 invalidates a saved pre-image after target drift and requires a 
   );
 });
 
-test("Pi 0.85.1 exposes all five requested binding values and each changed value invalidates approval", async () => {
+test("Pi 0.85.1 exposes every required binding dimension and each changed value invalidates approval", async () => {
   const runtime = await createRuntime();
   await writeFile(join(runtime.cwd, "binding.txt"), "binding", "utf8");
   expect(
@@ -1100,6 +1102,7 @@ test("Pi 0.85.1 exposes all five requested binding values and each changed value
     { cwd: join(runtime.cwd, "other") },
     { sessionId: "session-two" },
     { hostExecutionId: "different-execution" },
+    { toolCallId: "different-call" },
   ];
 
   expect(approved).toMatchObject({

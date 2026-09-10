@@ -170,7 +170,36 @@ test("A-005 file corpus covers supported classifications and neighboring blocks"
         { path: "note.txt" },
         "overridden",
       ),
-      expected: { kind: "unknown", mutatesState: "unknown" },
+      expected: {
+        kind: "unknown",
+        mutatesState: "unknown",
+        evidenceCodes: ["TOOL_IDENTITY_UNVERIFIED"],
+      },
+      target: { workspaceScope: "unknown", supportedPath: "no" },
+    },
+    {
+      name: "external same-name tool",
+      action: await classify(
+        workspace,
+        "read",
+        { path: "note.txt" },
+        "external",
+      ),
+      expected: {
+        kind: "unknown",
+        mutatesState: "unknown",
+        evidenceCodes: ["TOOL_IDENTITY_UNVERIFIED"],
+      },
+      target: { workspaceScope: "unknown", supportedPath: "no" },
+    },
+    {
+      name: "unknown custom tool",
+      action: await classify(workspace, "custom-read", {}, "unknown"),
+      expected: {
+        kind: "unknown",
+        mutatesState: "unknown",
+        evidenceCodes: ["TOOL_IDENTITY_UNVERIFIED"],
+      },
       target: { workspaceScope: "unknown", supportedPath: "no" },
     },
   ] as const;
@@ -191,9 +220,9 @@ test("A-005 file corpus covers supported classifications and neighboring blocks"
     "NEAREST_EXISTING_PARENT_VERIFIED",
   );
   expect(cases[5].action.targets[0]?.evidenceCodes).toContain("PATH_ABSOLUTE");
-  expect(distribution).toEqual({ read: 9, write: 3, edit: 1, unknown: 1 });
+  expect(distribution).toEqual({ read: 9, write: 3, edit: 1, unknown: 3 });
   console.info(
-    `A-005 classification distribution ${JSON.stringify(distribution)}`,
+    `A-005 file fixtures=${cases.length} classification=${JSON.stringify(distribution)}`,
   );
 });
 
@@ -217,6 +246,7 @@ test("A-005 validates the locked Pi read/write/edit schemas", async () => {
     expect(action).toMatchObject({ kind: "unknown", mutatesState: "unknown" });
     expect(action.evidenceCodes).toContain("INPUT_INVALID");
   }
+  console.info(`A-005 schema fixtures=${malformed.length}`);
 });
 
 test("A-005 handles drive and UNC syntax deterministically", async () => {
@@ -255,4 +285,7 @@ test("A-005 handles drive and UNC syntax deterministically", async () => {
     expect(uncWorkspace).toMatchObject({ outsideWorkspace: "unknown" });
     expect(uncWorkspace.targets[0]).toMatchObject({ supportedPath: "unknown" });
   }
+  console.info(
+    `A-005 root fixtures=${process.platform === "win32" ? 4 : 2} platform=${process.platform}`,
+  );
 });

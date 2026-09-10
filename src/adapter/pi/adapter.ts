@@ -540,6 +540,7 @@ export function registerPiAdapter(
   });
   pi.on("tool_call", async (event, ctx) => {
     let batch: readonly TransientHostExecutionInput[];
+    let currentToken: ApprovalToken | undefined;
     const toolCallId = event.toolCallId;
     try {
       if (activeExecutions.has(toolCallId)) throw new Error();
@@ -636,6 +637,7 @@ export function registerPiAdapter(
           observed.action.actionId,
           executionBinding(observed),
         );
+        currentToken = token;
         pendingTokens.add(token);
         const choice = await requestOutcomeApproval(
           ctx,
@@ -645,6 +647,7 @@ export function registerPiAdapter(
         if (choice !== "continue") {
           invalidateApprovalToken(token);
           pendingTokens.delete(token);
+          currentToken = undefined;
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: APPROVAL_STOPPED_REASON };
         }
@@ -666,6 +669,7 @@ export function registerPiAdapter(
         ) {
           invalidateApprovalToken(token);
           pendingTokens.delete(token);
+          currentToken = undefined;
           prepared = current;
           continue;
         }
@@ -685,6 +689,7 @@ export function registerPiAdapter(
         ) {
           invalidateApprovalToken(token);
           pendingTokens.delete(token);
+          currentToken = undefined;
           prepared = await assessMappedBatch(finalBatch, toolCallId);
           continue;
         }
@@ -696,11 +701,17 @@ export function registerPiAdapter(
           currentBinding,
         );
         pendingTokens.delete(token);
+        currentToken = undefined;
         if (consumed) return undefined;
         activeExecutions.delete(toolCallId);
         return { block: true as const, reason: APPROVAL_CHANGED_REASON };
       }
     } catch {
+      // 任一异常都必须立即撤销本次尚未消费的授权，不能等到会话清理才失效。
+      if (currentToken) {
+        invalidateApprovalToken(currentToken);
+        pendingTokens.delete(currentToken);
+      }
       activeExecutions.delete(toolCallId);
       return { block: true as const, reason: BLOCK_REASON };
     }

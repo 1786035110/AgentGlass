@@ -31,6 +31,7 @@ test.each([
   ["cwd", { cwd: "C:/other" }],
   ["sessionId", { sessionId: "session-2" }],
   ["hostExecutionId", { hostExecutionId: "execution-2" }],
+  ["toolCallId", { toolCallId: "call-2" }],
 ] as const)(
   "INV-007/008: changed %s invalidates the exact approval",
   (_name, change) => {

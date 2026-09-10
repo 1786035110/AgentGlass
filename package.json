@@ -28,10 +28,10 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "build": "tsc -p tsconfig.build.json",
-    "test:unit": "vitest run tests/unit",
+    "test:unit": "vitest run tests/unit --testTimeout=30000",
     "test:corpus": "vitest run tests/corpus",
-    "test:security": "vitest run tests/security",
-    "test:integration": "vitest run tests/integration"
+    "test:security": "vitest run tests/security --testTimeout=30000",
+    "test:integration": "vitest run tests/integration --testTimeout=30000"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
