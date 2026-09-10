@@ -8,8 +8,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
 
+const root = fileURLToPath(new URL("../../", import.meta.url));
+
 test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", async () => {
-  const root = fileURLToPath(new URL("../../", import.meta.url));
   const manifest: unknown = JSON.parse(
     await readFile(join(root, "package.json"), "utf8"),
   );
@@ -19,8 +20,14 @@ test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", asy
     engines: { node: ">=22.19.0" },
     keywords: ["pi-package"],
     pi: { extensions: ["extensions/agentglass.ts"] },
-    peerDependencies: { "@earendil-works/pi-coding-agent": "*" },
-    devDependencies: { "@earendil-works/pi-coding-agent": "0.85.1" },
+    peerDependencies: {
+      "@earendil-works/pi-coding-agent": "*",
+      "@earendil-works/pi-tui": "*",
+    },
+    devDependencies: {
+      "@earendil-works/pi-coding-agent": "0.85.1",
+      "@earendil-works/pi-tui": "0.85.1",
+    },
   });
   const installed: unknown = JSON.parse(
     await readFile(
@@ -29,6 +36,13 @@ test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", asy
     ),
   );
   expect(installed).toMatchObject({ version: "0.85.1" });
+  const installedTui: unknown = JSON.parse(
+    await readFile(
+      join(root, "node_modules/@earendil-works/pi-tui/package.json"),
+      "utf8",
+    ),
+  );
+  expect(installedTui).toMatchObject({ version: "0.85.1" });
 
   const temporary = await mkdtemp(join(tmpdir(), "agentglass-smoke-"));
   try {
@@ -66,3 +80,44 @@ test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", asy
     await rm(temporary, { recursive: true, force: true });
   }
 }, 30_000);
+
+test("A-015 Windows CI pins official actions and runs every existing gate in order", async () => {
+  const workflow = await readFile(
+    join(root, ".github", "workflows", "windows-ci.yml"),
+    "utf8",
+  );
+
+  expect(workflow).toMatch(
+    /on:\r?\n {2}pull_request:\r?\n {2}push:\r?\n {2}workflow_dispatch:/,
+  );
+  expect(workflow).toMatch(/permissions:\r?\n {2}contents: read/);
+  expect(workflow.match(/^ {4}runs-on:/gmu)).toEqual(["    runs-on:"]);
+  expect(workflow).toContain("runs-on: windows-latest");
+  expect(workflow).toContain(
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+  );
+  expect(workflow).toContain(
+    "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+  );
+  expect(workflow).toContain("node-version: 24.14.0");
+  expect(workflow).toContain("package-manager-cache: false");
+
+  // 工作流是执行供应链边界：只允许锁定 npm 后按固定顺序运行已存在的门槛；本检查不冒充远端执行结果。
+  const commands = [...workflow.matchAll(/^\s+- run: (.+)$/gmu)].map(
+    (match) => match[1],
+  );
+  expect(commands).toEqual([
+    "npm install --global npm@11.9.0",
+    "npm ci",
+    "npm run typecheck",
+    "npm run lint",
+    "npm run build",
+    "npm run test:unit",
+    "npm run test:corpus",
+    "npm run test:security",
+    "npm run test:integration",
+  ]);
+  expect(workflow).not.toMatch(
+    /continue-on-error|\bmatrix\b|\bsecrets\.|test:e2e|npm publish|deploy/iu,
+  );
+});

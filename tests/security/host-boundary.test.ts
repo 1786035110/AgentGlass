@@ -4,8 +4,9 @@ import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 
 const forbidden = [
-  /\b(?:from|import)\s*(?:\(\s*)?["'][^"']*(?:pi-coding-agent|adapter\/pi)/,
+  /\b(?:from|import)\s*(?:\(\s*)?["'][^"']*(?:pi-(?:coding-agent|tui)|adapter\/pi)/,
   /\b(?:ExtensionAPI|ExtensionContext|ToolCallEvent|ToolResultEvent|DefaultResourceLoader|SettingsManager)\b/,
+  /\btype\s*:\s*["'](?:tool_call|session_start|session_shutdown)["']/,
   /\bctx\s*\.\s*ui\b|\b(?:hasUI|appendEntry|agentDir|piToolCallId|piEvent|piContext|piTui)\b/i,
   /\bhost\s*:\s*["']pi["']|["']\.pi[\\/"']/i,
 ];
@@ -59,7 +60,21 @@ test.each([
     'import type { ToolCallEvent } from "@earendil-works/pi-coding-agent";',
     "Pi event type",
   ],
+  [
+    'const pi = await import("@earendil-works/pi-coding-agent");',
+    "dynamic Pi package import",
+  ],
   ['import "@earendil-works/pi-coding-agent";', "side-effect Pi import"],
+  [
+    'import { wrapTextWithAnsi } from "@earendil-works/pi-tui";',
+    "Pi TUI value",
+  ],
+  ['import type { Component } from "@earendil-works/pi-tui";', "Pi TUI type"],
+  ['const tui = import("@earendil-works/pi-tui");', "dynamic Pi TUI import"],
+  [
+    'type Event = { type: "tool_call"; toolCallId: string; input: unknown }',
+    "Pi event structure",
+  ],
   [
     "type Context = { hasUI: boolean; agentDir: string }",
     "Pi capability/default path",

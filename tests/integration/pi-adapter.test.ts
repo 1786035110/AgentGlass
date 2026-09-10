@@ -62,6 +62,7 @@ function assistantMessage(
 async function createRuntime(options?: {
   overriddenRead?: boolean;
   snapshotUnavailable?: boolean;
+  bindUI?: boolean;
 }) {
   const cwd = await mkdtemp(join(tmpdir(), "agentglass-adapter-"));
   temporaryDirectories.push(cwd);
@@ -117,7 +118,13 @@ async function createRuntime(options?: {
         }
       : {}),
   });
-  await session.bindExtensions({ mode: "print" });
+  const uiContext = options?.bindUI
+    ? session.extensionRunner.getUIContext()
+    : undefined;
+  await session.bindExtensions({
+    mode: options?.bindUI ? "tui" : "print",
+    ...(uiContext ? { uiContext } : {}),
+  });
   return { cwd, observed, session, sessionManager };
 }
 
@@ -145,7 +152,7 @@ type TestCustomFactory<T> = (
 function installApprovalUi(
   runtime: Awaited<ReturnType<typeof createRuntime>>,
   steps: ApprovalUiStep[],
-  mode: "tui" | "rpc" = "tui",
+  mode: "tui" | "rpc" | "print" | "json" = "tui",
 ) {
   const runner = runtime.session.extensionRunner;
   const base = runner.getUIContext();
@@ -422,16 +429,38 @@ test("Pi 0.85.1 sibling guard blocks only mutation/unknown members when a batch 
   }
 });
 
-test("Pi 0.85.1 verified read/write/edit identities use their locked schemas", async () => {
+test("Pi 0.85.1 verified read/write/edit sources and schemas stay locked", async () => {
   const runtime = await createRuntime();
   await writeFile(join(runtime.cwd, "existing.txt"), "before", "utf8");
   await setGoal(runtime, "classify built-in file tools");
+  const fileTools = runtime.session
+    .getAllTools()
+    .filter((tool) => ["read", "write", "edit"].includes(tool.name));
   const schemas = Object.fromEntries(
-    runtime.session
-      .getAllTools()
-      .filter((tool) => ["read", "write", "edit"].includes(tool.name))
-      .map((tool) => [tool.name, tool.parameters]),
+    fileTools.map((tool) => [tool.name, tool.parameters]),
   );
+  expect(
+    Object.fromEntries(fileTools.map((tool) => [tool.name, tool.sourceInfo])),
+  ).toEqual({
+    read: {
+      path: "<builtin:read>",
+      source: "builtin",
+      scope: "temporary",
+      origin: "top-level",
+    },
+    write: {
+      path: "<builtin:write>",
+      source: "builtin",
+      scope: "temporary",
+      origin: "top-level",
+    },
+    edit: {
+      path: "<builtin:edit>",
+      source: "builtin",
+      scope: "temporary",
+      origin: "top-level",
+    },
+  });
   expect(schemas).toMatchObject({
     read: {
       required: ["path"],
@@ -553,6 +582,9 @@ test("Pi 0.85.1 capability modes do not equate hasUI with safe approval", async 
     ["json", undefined, "event_stream", "no"],
     ["print", undefined, "one_shot", "no"],
     ["tui", undefined, "unknown", "unknown"],
+    ["rpc", undefined, "unknown", "unknown"],
+    ["json", dialogContext, "unknown", "unknown"],
+    ["print", dialogContext, "unknown", "unknown"],
   ] as const;
 
   for (const [mode, ui, interaction, canPromptForApproval] of cases) {
@@ -736,12 +768,18 @@ test("missing, duplicate, changed-session, and incomplete sibling identities fai
 });
 
 test("active execution and goal state are cleaned up by Pi lifecycle events", async () => {
-  const runtime = await createRuntime();
+  const runtime = await createRuntime({ bindUI: true });
   await setGoal(runtime, "first goal");
   await writeFile(join(runtime.cwd, "note.txt"), "note", "utf8");
   const call = { id: "reused", name: "read", arguments: { path: "note.txt" } };
   expect(await emitCall(runtime, call)).toBeUndefined();
   const firstExecutionId = runtime.observed[0]?.hostExecutionId;
+  const firstFacts = runtime.observed[0];
+  if (!firstFacts) throw new Error("real Pi facts missing");
+  const oldSessionToken = issueApprovalToken(
+    firstFacts.action.actionId,
+    executionBinding(firstFacts),
+  );
   expect(
     await runtime.session.extensionRunner.emitToolCall({
       type: "tool_call",
@@ -766,6 +804,12 @@ test("active execution and goal state are cleaned up by Pi lifecycle events", as
       input: call.arguments,
     }),
   ).toBeUndefined();
+
+  const runnerBeforeReload = runtime.session.extensionRunner;
+  await runtime.session.reload();
+  expect(runtime.session.extensionRunner).not.toBe(runnerBeforeReload);
+  expect(await emitCall(runtime, call)).toBeUndefined();
+  expect(runtime.observed.at(-1)?.userGoal).toEqual({ status: "unknown" });
 
   await runtime.session.extensionRunner.emit({
     type: "agent_end",
@@ -799,8 +843,52 @@ test("active execution and goal state are cleaned up by Pi lifecycle events", as
   });
   await setGoal(runtime, "second goal");
   expect(await emitCall(runtime, call)).toBeUndefined();
-  expect(runtime.observed.at(-1)).toMatchObject({ sessionId: "session-two" });
-  expect(runtime.observed.at(-1)?.hostExecutionId).not.toBe(firstExecutionId);
+  const secondSessionFacts = runtime.observed.at(-1);
+  expect(secondSessionFacts).toMatchObject({ sessionId: "session-two" });
+  expect(secondSessionFacts?.hostExecutionId).not.toBe(firstExecutionId);
+  if (!secondSessionFacts) throw new Error("new Pi session facts missing");
+  expect(
+    consumeApprovalToken(
+      oldSessionToken,
+      firstFacts.action.actionId,
+      executionBinding(secondSessionFacts),
+    ),
+  ).toBe(false);
+});
+
+test("Pi 0.85.1 binds the real cwd so approval cannot cross project sessions", async () => {
+  const first = await createRuntime();
+  const second = await createRuntime();
+  await Promise.all([
+    writeFile(join(first.cwd, "same.txt"), "same", "utf8"),
+    writeFile(join(second.cwd, "same.txt"), "same", "utf8"),
+  ]);
+  const call = {
+    id: "same-call",
+    name: "read",
+    arguments: { path: "same.txt" },
+  };
+  expect(await emitCall(first, call)).toBeUndefined();
+  expect(await emitCall(second, call)).toBeUndefined();
+  const firstFacts = first.observed[0];
+  const secondFacts = second.observed[0];
+  if (!firstFacts || !secondFacts) throw new Error("real Pi facts missing");
+
+  expect(firstFacts.cwd).not.toBe(secondFacts.cwd);
+  expect(firstFacts.sessionId).toBe(secondFacts.sessionId);
+  expect(firstFacts.toolCallId).toBe(secondFacts.toolCallId);
+  expect(firstFacts.action.fingerprint).toEqual(secondFacts.action.fingerprint);
+  const token = issueApprovalToken(
+    firstFacts.action.actionId,
+    executionBinding(firstFacts),
+  );
+  expect(
+    consumeApprovalToken(
+      token,
+      firstFacts.action.actionId,
+      executionBinding(secondFacts),
+    ),
+  ).toBe(false);
 });
 
 test("raw tool and goal secrets never enter observable or blocked adapter output", async () => {
@@ -962,6 +1050,19 @@ test("Pi 0.85.1 abort, missing custom result, UI error, RPC hasUI, and no UI can
   });
   await expect(pending).resolves.toMatchObject({ block: true });
 
+  const reloaded = await createRuntime({ bindUI: true });
+  const reloadUi = installApprovalUi(reloaded, [{}]);
+  const pendingReload = emitCall(reloaded, {
+    id: "reload-write",
+    name: "write",
+    arguments: { path: "reload.txt", content: "must not run" },
+  });
+  await vi.waitFor(() => expect(reloadUi.customCalls).toBe(1), {
+    timeout: 30_000,
+  });
+  await reloaded.session.reload();
+  await expect(pendingReload).resolves.toMatchObject({ block: true });
+
   for (const fixture of [
     { name: "missing custom result", step: { missingResult: true } },
     { name: "UI error", step: { error: true } },
@@ -995,6 +1096,26 @@ test("Pi 0.85.1 abort, missing custom result, UI error, RPC hasUI, and no UI can
   });
   expect(rpcUi.customCalls).toBe(0);
 
+  for (const mode of ["print", "json"] as const) {
+    const conflicting = await createRuntime();
+    const conflictingUi = installApprovalUi(
+      conflicting,
+      [{ inputs: ["down", "down", "enter"] }],
+      mode,
+    );
+    expect(
+      await emitCall(conflicting, {
+        id: `${mode}-ui-write`,
+        name: "write",
+        arguments: { path: `${mode}.txt`, content: "must not run" },
+      }),
+    ).toMatchObject({
+      block: true,
+      reason: expect.stringContaining("本地审批界面"),
+    });
+    expect(conflictingUi.customCalls).toBe(0);
+  }
+
   const noUi = await createRuntime();
   expect(
     await emitCall(noUi, {
@@ -1012,6 +1133,17 @@ test("Pi 0.85.1 abort, missing custom result, UI error, RPC hasUI, and no UI can
       id: "json-write",
       name: "write",
       arguments: { path: "json.txt", content: "must not run" },
+    }),
+  ).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("本地审批界面"),
+  });
+  noUi.session.extensionRunner.setUIContext(undefined, "tui");
+  expect(
+    await emitCall(noUi, {
+      id: "tui-no-ui-write",
+      name: "write",
+      arguments: { path: "tui.txt", content: "must not run" },
     }),
   ).toMatchObject({
     block: true,
