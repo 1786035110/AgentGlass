@@ -1080,16 +1080,13 @@ export async function restoreRecoveryEntry(
             Number(manifest.prePermissions.gid),
           );
         }
-        await rename(temp, manifest.targetPath);
         if (
           process.platform === "win32" &&
           manifest.prePermissions.acl?.format === "sddl"
         ) {
-          await applyWindowsTargetAcl(
-            manifest.targetPath,
-            manifest.prePermissions.acl.value,
-          );
+          await applyWindowsTargetAcl(temp, manifest.prePermissions.acl.value);
         }
+        await rename(temp, manifest.targetPath);
         await syncDirectory(path.dirname(manifest.targetPath));
       } finally {
         await removePrivateFile(temp);
