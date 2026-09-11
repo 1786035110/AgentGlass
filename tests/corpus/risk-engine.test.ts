@@ -9,8 +9,13 @@ import type {
 } from "../../src/core/domain.js";
 import { classifyFileAction } from "../../src/core/file-classification.js";
 import {
+  noPreImageSnapshot,
+  unavailablePreImageSnapshot,
+} from "../../src/core/pre-image-snapshot.js";
+import {
   assessRisk,
   assessSiblingMutationRisk,
+  requireMutationBackup,
 } from "../../src/core/risk-engine.js";
 import { actionFacts } from "../fixtures/action-facts.js";
 
@@ -149,6 +154,55 @@ test("A-013 product decisions stay separate from shell dispositions", () => {
   console.info(
     `A-013 product fixtures=${ruleCases.length} decisions=${JSON.stringify(distribution)}`,
   );
+});
+
+test("B-001 backup gate covers hit, neighboring read, quota fault, and implicit parents", () => {
+  const saved = {
+    status: "saved",
+    snapshotId: "00000000-0000-4000-8000-000000000000",
+    targetExisted: "yes",
+    permissionMetadata: "captured",
+    failureCode: null,
+    canRestoreNow: false,
+    recoveryGrade: "unknown",
+  } as const;
+  expect(
+    requireMutationBackup(modify, assessRisk(modify), saved).decision,
+  ).toBe("ask");
+  expect(
+    requireMutationBackup(modify, assessRisk(modify), noPreImageSnapshot()),
+  ).toMatchObject({
+    decision: "hard_block",
+    reasonCodes: expect.arrayContaining(["BACKUP_UNAVAILABLE"]),
+  });
+  expect(
+    requireMutationBackup(
+      modify,
+      assessRisk(modify),
+      unavailablePreImageSnapshot("SNAPSHOT_RESOURCE_LIMIT", "yes"),
+    ),
+  ).toHaveProperty("decision", "hard_block");
+  const implicitParent = actionFacts(
+    {
+      kind: "write",
+      mutatesState: "yes",
+      impactFacts: { effect: "create", createsParentDirectories: "yes" },
+    },
+    { state: "new_file" },
+  );
+  expect(
+    requireMutationBackup(implicitParent, assessRisk(implicitParent), saved),
+  ).toMatchObject({
+    decision: "hard_block",
+    reasonCodes: expect.arrayContaining(["BACKUP_UNAVAILABLE"]),
+  });
+  expect(
+    requireMutationBackup(
+      ordinaryRead,
+      assessRisk(ordinaryRead),
+      noPreImageSnapshot(),
+    ),
+  ).toEqual(assessRisk(ordinaryRead));
 });
 
 test("A-007 consumes real file-classifier facts without widening support", async () => {

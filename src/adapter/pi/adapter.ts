@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import type {
+  EditToolInput,
   ExtensionAPI,
   ExtensionContext,
   ToolCallEvent,
   ToolInfo,
 } from "@earendil-works/pi-coding-agent";
+import { createEditToolDefinition } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
   consumeApprovalToken,
@@ -16,11 +18,13 @@ import {
 import type {
   ApprovalToken,
   ExecutionBinding,
+  ExpectedFilePostcondition,
   HostCapabilities,
   HostExecutionFacts,
   HostToolIdentity,
   ObservableUserGoal,
   OutcomeCard,
+  PredictedEffect,
   RiskAssessment,
   SiblingExecutionReference,
   TransientHostExecutionInput,
@@ -30,9 +34,16 @@ import {
   projectObservableUserGoal,
 } from "../../core/execution-input.js";
 import { resolveSensitiveSnapshotTarget } from "../../core/file-classification.js";
+import {
+  FILE_OBSERVATION_LIMIT_BYTES,
+  hashFileBytes,
+  unverifiableResult,
+  verifyFilePostcondition,
+} from "../../core/file-verification.js";
 import { fingerprintTransientActionInput } from "../../core/input-boundary.js";
 import {
   renderOutcomeCard,
+  renderOutcomeCardUpdate,
   renderReadNotice,
 } from "../../core/outcome-card.js";
 import {
@@ -41,7 +52,11 @@ import {
   verifyPreImageSnapshotBaseline,
 } from "../../core/pre-image-snapshot.js";
 import { predictEffects } from "../../core/predicted-effects.js";
-import { assessSiblingMutationRisk } from "../../core/risk-engine.js";
+import {
+  assessSiblingMutationRisk,
+  requireMutationBackup,
+} from "../../core/risk-engine.js";
+import { readStableFile } from "../../core/stable-file.js";
 
 type AdapterObserver = (facts: HostExecutionFacts) => Promise<void> | void;
 
@@ -59,10 +74,22 @@ const APPROVAL_CHANGED_REASON =
   "已停止：审批期间动作或运行环境发生变化。旧批准已失效，请重新提出当前这一步。";
 const SAFETY_BLOCK_REASON =
   "已停止：当前版本无法可靠说明或支持这一步。请改为普通项目文件的查看或单个修改。";
+const BACKUP_BLOCK_REASON =
+  "已停止：未能取得这次修改所需的修改前证据，或这一步会创建缺少的上级文件夹。请明确选择已有文件夹中的一份普通文件后重试。";
 const READ_STATUS_KEY = "agentglass-read";
+const ACTION_CARD_KEY = "agentglass-action";
 
 // 仅区分“批次无法证明”和其他宿主身份失败，以选择真实且脱敏的固定原因；异常文本从不返回 Pi。
 class SiblingContextError extends Error {}
+
+interface PendingVerification {
+  binding: Readonly<ExecutionBinding>;
+  action: HostExecutionFacts["action"];
+  effect: PredictedEffect;
+  targetPath: string;
+  expected: ExpectedFilePostcondition;
+  inFlight: boolean;
+}
 
 const knownBuiltinNames = new Set([
   "read",
@@ -228,6 +255,134 @@ function sameRuntimeEnvelope(
       facts.capabilities.canPromptForApproval &&
     JSON.stringify(transient.siblings) === JSON.stringify(facts.siblings)
   );
+}
+
+function ownDataValue(input: unknown, key: string): unknown {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return;
+  const descriptor = Object.getOwnPropertyDescriptor(input, key);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+}
+
+async function prepareExpectedPostcondition(
+  event: ToolCallEvent,
+  ctx: ExtensionContext,
+  facts: HostExecutionFacts,
+  effect: PredictedEffect,
+  target: NonNullable<
+    Awaited<ReturnType<typeof resolveSensitiveSnapshotTarget>>
+  >,
+): Promise<ExpectedFilePostcondition> {
+  const before = target.targetExisted
+    ? await readStableFile(target.targetPath, FILE_OBSERVATION_LIMIT_BYTES)
+    : undefined;
+  const base = {
+    actionId: facts.action.actionId,
+    effectId: effect.effectId,
+    targetId: effect.targetId,
+    beforeSha256: before ? hashFileBytes(before.bytes) : null,
+    beforeIdentity: before?.identity ?? null,
+    targetExisted: target.targetExisted,
+  } as const;
+
+  if (facts.action.kind === "write") {
+    const content = ownDataValue(event.input, "content");
+    if (typeof content !== "string") throw new Error();
+    const bytes = Buffer.from(content, "utf8");
+    return Object.freeze({
+      ...base,
+      kind: "exact_bytes",
+      expectedSha256: hashFileBytes(bytes),
+      expectedByteLength: bytes.length,
+    });
+  }
+
+  if (facts.action.kind !== "edit" || !before) throw new Error();
+  let finalContent: string | undefined;
+  try {
+    // 直接调用锁定 Pi 0.85.1 的 edit 实现，只把文件操作替换为内存读写；这样匹配、
+    // 歧义、NFKC、BOM 与换行语义和真正执行保持一致，又不保存编辑正文用于稍后重放。
+    const definition = createEditToolDefinition(ctx.cwd, {
+      operations: {
+        access: async () => {},
+        readFile: async () => before.bytes,
+        writeFile: async (_path, content) => {
+          finalContent = content;
+        },
+      },
+    });
+    await definition.execute(
+      "agentglass-expected-postcondition",
+      event.input as EditToolInput,
+      undefined,
+      undefined,
+      ctx,
+    );
+  } catch {
+    return Object.freeze({
+      ...base,
+      kind: "content_changed",
+      expectedSha256: null,
+      expectedByteLength: null,
+    });
+  }
+  if (finalContent === undefined) throw new Error();
+  const bytes = Buffer.from(finalContent, "utf8");
+  return Object.freeze({
+    ...base,
+    kind: "exact_bytes",
+    expectedSha256: hashFileBytes(bytes),
+    expectedByteLength: bytes.length,
+  });
+}
+
+function resultBindingMatches(
+  pi: ExtensionAPI,
+  pending: Pick<PendingVerification, "binding">,
+  toolCallId: string,
+  toolName: string,
+  input: unknown,
+  ctx: ExtensionContext,
+): boolean {
+  try {
+    const currentSession = ctx.sessionManager.getSessionId();
+    return (
+      nonEmptyString(currentSession) &&
+      pending.binding.sessionId === currentSession &&
+      pending.binding.cwd === ctx.cwd &&
+      pending.binding.toolCallId === toolCallId &&
+      pending.binding.hostExecutionId ===
+        hostExecutionId(currentSession, toolCallId) &&
+      pending.binding.toolName === toolName &&
+      mapToolIdentity(toolName, configuredTools(pi)).status ===
+        "verified_builtin" &&
+      fingerprintTransientActionInput(toolName, input).value ===
+        pending.binding.fingerprint.value
+    );
+  } catch {
+    return false;
+  }
+}
+
+function setActionCard(
+  ctx: ExtensionContext,
+  update: ReturnType<typeof renderOutcomeCardUpdate>,
+): void {
+  if (ctx.mode !== "tui" || !ctx.hasUI) return;
+  try {
+    // modal 在 Continue 后由 Pi 关闭；稳定 key 让同一逻辑动作卡在原位置区域进入执行/结果态。
+    ctx.ui.setWidget(ACTION_CARD_KEY, [...update.lines]);
+  } catch {
+    // 展示失败不能改写已经完成的文件事实，也不能泄漏宿主异常文本。
+  }
+}
+
+function setReadStatus(ctx: ExtensionContext, text: string): void {
+  if (ctx.mode !== "tui" || !ctx.hasUI) return;
+  try {
+    ctx.ui.setStatus(READ_STATUS_KEY, text);
+  } catch {
+    // 结果提示失败不能反过来篡改工具结果或泄漏 UI 异常。
+  }
 }
 
 export function mapPiCapabilities(
@@ -443,16 +598,40 @@ export function registerPiAdapter(
   let sessionId: string | undefined;
   let userGoal: ObservableUserGoal = Object.freeze({ status: "unknown" });
   // pending 只保存不透明身份字符串；raw input、goal 原文和 Pi event/ctx 都不会进入此 Map。
-  const activeExecutions = new Map<string, string>();
+  const activeExecutions = new Map<
+    string,
+    { hostExecutionId: string; toolName: string; cwd: string }
+  >();
+  const pendingVerifications = new Map<string, PendingVerification>();
+  const pendingReads = new Map<
+    string,
+    { binding: Readonly<ExecutionBinding> }
+  >();
   const pendingTokens = new Set<ApprovalToken>();
   const pendingApprovalCancels = new Set<() => void>();
+  let runGeneration = 0;
 
-  const clearRun = (): void => {
+  const clearRun = (ctx?: ExtensionContext): void => {
+    if (ctx) {
+      for (const pending of pendingVerifications.values()) {
+        setActionCard(
+          ctx,
+          renderOutcomeCardUpdate(
+            pending.action,
+            pending.effect,
+            unverifiableResult(pending.expected, "unknown", "RESULT_MISSING"),
+          ),
+        );
+      }
+    }
     for (const cancel of [...pendingApprovalCancels]) cancel();
     for (const token of pendingTokens) invalidateApprovalToken(token);
     pendingApprovalCancels.clear();
     pendingTokens.clear();
+    pendingVerifications.clear();
+    pendingReads.clear();
     activeExecutions.clear();
+    runGeneration += 1;
     userGoal = Object.freeze({ status: "unknown" });
   };
 
@@ -548,7 +727,11 @@ export function registerPiAdapter(
       const current = batch.find((item) => item.toolCallId === toolCallId);
       if (!current) throw new Error();
       // 在第一个 await 前同步占位；同一调用的并发重入只能看到已占用状态并失败关闭。
-      activeExecutions.set(toolCallId, current.hostExecutionId);
+      activeExecutions.set(toolCallId, {
+        hostExecutionId: current.hostExecutionId,
+        toolName: current.tool.name,
+        cwd: current.cwd,
+      });
     } catch (error) {
       return {
         block: true,
@@ -565,6 +748,13 @@ export function registerPiAdapter(
       // 结果卡重新生成时才重新读取 event.input；token、pending 集合和 observer 都不保存 raw input。
       for (;;) {
         let observed = prepared.facts;
+        let currentRisk = prepared.risk;
+        let verificationTarget:
+          | NonNullable<
+              Awaited<ReturnType<typeof resolveSensitiveSnapshotTarget>>
+            >
+          | undefined;
+        let expected: ExpectedFilePostcondition | undefined;
         if (prepared.risk.decision === "ask") {
           observed = Object.freeze({
             ...prepared.facts,
@@ -592,6 +782,11 @@ export function registerPiAdapter(
             prepared = beforeCard;
             continue;
           }
+          currentRisk = requireMutationBackup(
+            observed.action,
+            prepared.risk,
+            observed.preImage,
+          );
         }
         await observe(observed);
 
@@ -603,19 +798,26 @@ export function registerPiAdapter(
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: BATCH_CONTEXT_REASON };
         }
-        const effect = predictEffects(observed.action, prepared.risk)[0];
+        const effect = predictEffects(observed.action, currentRisk)[0];
         if (!effect) throw new Error();
-        if (prepared.risk.decision === "auto_allow") {
-          if (ctx.mode === "tui" && ctx.hasUI)
-            ctx.ui.setStatus(
-              READ_STATUS_KEY,
-              renderReadNotice(observed.action, prepared.risk, effect),
-            );
+        if (currentRisk.decision === "auto_allow") {
+          setReadStatus(
+            ctx,
+            renderReadNotice(observed.action, prepared.risk, effect),
+          );
+          pendingReads.set(toolCallId, {
+            binding: executionBinding(observed),
+          });
           return undefined;
         }
-        if (prepared.risk.decision === "hard_block") {
+        if (currentRisk.decision === "hard_block") {
           activeExecutions.delete(toolCallId);
-          return { block: true as const, reason: SAFETY_BLOCK_REASON };
+          return {
+            block: true as const,
+            reason: currentRisk.reasonCodes.includes("BACKUP_UNAVAILABLE")
+              ? BACKUP_BLOCK_REASON
+              : SAFETY_BLOCK_REASON,
+          };
         }
         if (
           ctx.mode !== "tui" ||
@@ -626,9 +828,31 @@ export function registerPiAdapter(
           return { block: true as const, reason: APPROVAL_UNAVAILABLE_REASON };
         }
 
+        verificationTarget = await resolveCurrentSnapshot(
+          event,
+          ctx,
+          observed.action,
+        );
+        if (!verificationTarget) {
+          activeExecutions.delete(toolCallId);
+          return { block: true as const, reason: SAFETY_BLOCK_REASON };
+        }
+        try {
+          expected = await prepareExpectedPostcondition(
+            event,
+            ctx,
+            observed,
+            effect,
+            verificationTarget,
+          );
+        } catch {
+          activeExecutions.delete(toolCallId);
+          return { block: true as const, reason: SAFETY_BLOCK_REASON };
+        }
+
         const card = renderOutcomeCard(
           observed.action,
-          prepared.risk,
+          currentRisk,
           effect,
           observed.preImage,
           observed.capabilities,
@@ -702,7 +926,18 @@ export function registerPiAdapter(
         );
         pendingTokens.delete(token);
         currentToken = undefined;
-        if (consumed) return undefined;
+        if (consumed && verificationTarget && expected) {
+          pendingVerifications.set(toolCallId, {
+            binding: token.binding,
+            action: observed.action,
+            effect,
+            targetPath: verificationTarget.targetPath,
+            expected,
+            inFlight: false,
+          });
+          setActionCard(ctx, renderOutcomeCardUpdate(observed.action, effect));
+          return undefined;
+        }
         activeExecutions.delete(toolCallId);
         return { block: true as const, reason: APPROVAL_CHANGED_REASON };
       }
@@ -716,10 +951,103 @@ export function registerPiAdapter(
       return { block: true as const, reason: BLOCK_REASON };
     }
   });
-  pi.on("tool_execution_end", (event) => {
+  pi.on("tool_result", async (event, ctx) => {
+    const read = pendingReads.get(event.toolCallId);
+    if (read) {
+      pendingReads.delete(event.toolCallId);
+      const matched = resultBindingMatches(
+        pi,
+        read,
+        event.toolCallId,
+        event.toolName,
+        event.input,
+        ctx,
+      );
+      setReadStatus(
+        ctx,
+        matched && !event.isError
+          ? "已完成这次文件查看；文件内容由 Pi 显示。"
+          : "无法确认这次文件查看是否完成。",
+      );
+      return;
+    }
+
+    const pending = pendingVerifications.get(event.toolCallId);
+    if (!pending || pending.inFlight) return;
+    pending.inFlight = true;
+    const generation = runGeneration;
+    const matches = resultBindingMatches(
+      pi,
+      pending,
+      event.toolCallId,
+      event.toolName,
+      event.input,
+      ctx,
+    );
+    const outcome = event.isError ? "failed" : "succeeded";
+    const observed = await verifyFilePostcondition(
+      pending.targetPath,
+      pending.expected,
+      outcome,
+    );
+    if (
+      runGeneration !== generation ||
+      pendingVerifications.get(event.toolCallId) !== pending
+    ) {
+      return;
+    }
+    const report = matches
+      ? observed
+      : unverifiableResult(
+          pending.expected,
+          outcome,
+          "RESULT_IDENTITY_MISMATCH",
+        );
+    setActionCard(
+      ctx,
+      renderOutcomeCardUpdate(pending.action, pending.effect, report),
+    );
+    pendingVerifications.delete(event.toolCallId);
+  });
+  pi.on("tool_execution_end", (event, ctx) => {
+    let endMatches = false;
+    try {
+      const currentSession = ctx.sessionManager.getSessionId();
+      const active = activeExecutions.get(event.toolCallId);
+      endMatches = Boolean(
+        active &&
+          nonEmptyString(currentSession) &&
+          currentSession === sessionId &&
+          ctx.cwd === active.cwd &&
+          active.hostExecutionId ===
+            hostExecutionId(currentSession, event.toolCallId) &&
+          active.toolName === event.toolName,
+      );
+    } catch {
+      endMatches = false;
+    }
+    if (!endMatches) return;
+    const pending = pendingVerifications.get(event.toolCallId);
+    if (pending && !pending.inFlight) {
+      setActionCard(
+        ctx,
+        renderOutcomeCardUpdate(
+          pending.action,
+          pending.effect,
+          unverifiableResult(
+            pending.expected,
+            event.isError ? "failed" : "unknown",
+            "RESULT_MISSING",
+          ),
+        ),
+      );
+      pendingVerifications.delete(event.toolCallId);
+    }
+    if (pendingReads.delete(event.toolCallId))
+      setReadStatus(ctx, "无法确认这次文件查看是否完成。");
     activeExecutions.delete(event.toolCallId);
   });
-  pi.on("agent_end", () => clearRun());
+  pi.on("agent_end", (_event, ctx) => clearRun(ctx));
   pi.on("session_shutdown", () => {
     clearRun();
     sessionId = undefined;

@@ -1,6 +1,13 @@
 import { expect, test } from "vitest";
 import type { ActionFacts } from "../../src/core/domain.js";
-import { assessRisk } from "../../src/core/risk-engine.js";
+import {
+  noPreImageSnapshot,
+  unavailablePreImageSnapshot,
+} from "../../src/core/pre-image-snapshot.js";
+import {
+  assessRisk,
+  requireMutationBackup,
+} from "../../src/core/risk-engine.js";
 import { actionFacts } from "../fixtures/action-facts.js";
 
 test("A-007 applies the three terminal file decisions", () => {
@@ -101,4 +108,34 @@ test("A-007 fails closed when classifier facts explicitly contradict each other"
     decision: "hard_block",
     reasonCodes: ["PREFLIGHT_FAILED", "FILE_MODIFY"],
   });
+});
+
+test("B-001 requires saved single-file evidence before any mutation", () => {
+  const action = actionFacts({
+    kind: "edit",
+    mutatesState: "yes",
+    impactFacts: { effect: "edit", createsParentDirectories: "no" },
+  });
+  const baseline = assessRisk(action);
+  expect(requireMutationBackup(action, baseline, noPreImageSnapshot())).toEqual(
+    {
+      level: "high",
+      decision: "hard_block",
+      reasonCodes: ["BACKUP_UNAVAILABLE", "FILE_MODIFY"],
+    },
+  );
+  expect(
+    requireMutationBackup(
+      action,
+      baseline,
+      unavailablePreImageSnapshot("SNAPSHOT_RESOURCE_LIMIT", "yes"),
+    ),
+  ).toHaveProperty("decision", "hard_block");
+  expect(
+    requireMutationBackup(
+      actionFacts(),
+      assessRisk(actionFacts()),
+      noPreImageSnapshot(),
+    ),
+  ).toEqual(assessRisk(actionFacts()));
 });

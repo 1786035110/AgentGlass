@@ -10,6 +10,7 @@ export type RiskReasonCode =
   | "SAFETY_CONTROL_MUTATION"
   | "BATCH_MUTATION_BLOCKED"
   | "BATCH_CONTEXT_UNKNOWN"
+  | "BACKUP_UNAVAILABLE"
   | "UNSUPPORTED_TOOL"
   | "SENSITIVE_TARGET"
   | "OUTSIDE_WORKSPACE"
@@ -153,6 +154,47 @@ export type PreImageSnapshotEvidence = Readonly<{
 export type VerificationCorrelation = Readonly<
   Pick<ActionFacts, "actionId"> & Pick<PredictedEffect, "effectId" | "targetId">
 >;
+
+export type FileVerificationStatus = "matched" | "mismatch" | "unknown";
+export type ToolOutcomeStatus = "succeeded" | "failed" | "unknown";
+
+// B-001 只保留核验所需的摘要与不透明关联。正文、raw 参数和完整工具结果不会进入该对象。
+export interface ExpectedFilePostcondition extends VerificationCorrelation {
+  kind: "exact_bytes" | "content_changed";
+  expectedSha256: string | null;
+  expectedByteLength: number | null;
+  beforeSha256: string | null;
+  beforeIdentity: Readonly<{ device: string; inode: string }> | null;
+  targetExisted: boolean;
+}
+
+export type VerificationReasonCode =
+  | "POSTCONDITION_MATCHED"
+  | "POSTCONDITION_MISMATCH"
+  | "POSTCONDITION_INSUFFICIENT"
+  | "RESULT_MISSING"
+  | "RESULT_IDENTITY_MISMATCH"
+  | "TARGET_IDENTITY_CHANGED"
+  | "TARGET_MISSING"
+  | "TARGET_UNSUPPORTED"
+  | "TARGET_TOO_LARGE"
+  | "TARGET_GREW_OVER_LIMIT"
+  | "TARGET_CHANGED_DURING_READ"
+  | "TARGET_READ_FAILED";
+
+export interface VerificationReport extends VerificationCorrelation {
+  status: FileVerificationStatus;
+  toolOutcome: ToolOutcomeStatus;
+  reasonCodes: readonly VerificationReasonCode[];
+  checkScope: "single_file";
+  applicationOutcome: "unverifiable";
+}
+
+export interface OutcomeCardUpdate {
+  actionId: string;
+  state: "executing" | "matched" | "mismatch" | "unknown";
+  lines: readonly string[];
+}
 
 export type TransientRawInput = unknown;
 

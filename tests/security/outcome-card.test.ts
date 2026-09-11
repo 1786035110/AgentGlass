@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { expect, test } from "vitest";
 import {
   renderOutcomeCard,
+  renderOutcomeCardUpdate,
   renderReadNotice,
 } from "../../src/core/outcome-card.js";
 import { outcomeCardFixtures } from "../fixtures/outcome-cards.js";
@@ -169,4 +170,28 @@ test("INV-010/013: batch block keeps sequential-retry and other danger explanati
   expect(multiple).toContain("原内容可能丢失");
   expect(incomplete).toContain("无法确认同时提出的操作是否完整");
   expect(incomplete).toContain("执行前的必要检查没有完成");
+});
+
+test("INV-005/009: B-001 result feedback redacts labels and never exposes result bodies or recovery claims", () => {
+  const fixture = outcomeCardFixtures.find(
+    (item) => item.name === "synthetic secret in label",
+  );
+  if (!fixture) throw new Error("fixture missing");
+  const update = renderOutcomeCardUpdate(fixture.action, fixture.effect, {
+    actionId: fixture.action.actionId,
+    effectId: fixture.effect.effectId,
+    targetId: fixture.effect.targetId,
+    status: "unknown",
+    toolOutcome: "unknown",
+    reasonCodes: ["RESULT_MISSING"],
+    checkScope: "single_file",
+    applicationOutcome: "unverifiable",
+  });
+  const output = update.lines.join("\n");
+  expect(output).toContain("[REDACTED]");
+  expect(output).not.toContain("synthetic-secret-value");
+  expect(output).not.toContain("RESULT_MISSING");
+  expect(output).toContain("无法确认工具是否完成");
+  expect(output).toContain("当前不能自动恢复");
+  expect(output).not.toMatch(/可以恢复|可撤销|Undo|回滚/u);
 });

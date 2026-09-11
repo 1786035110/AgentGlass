@@ -2,10 +2,12 @@ import type {
   ActionFacts,
   HostCapabilities,
   OutcomeCard,
+  OutcomeCardUpdate,
   PredictedEffect,
   PreImageSnapshotEvidence,
   RiskAssessment,
   RiskReasonCode,
+  VerificationReport,
 } from "./domain.js";
 import { redactDisplayString } from "./input-boundary.js";
 import { assessRisk } from "./risk-engine.js";
@@ -34,6 +36,8 @@ const riskExplanations: Readonly<Record<RiskReasonCode, string>> = {
     "这次包含多个会改变内容或影响未知的操作，必须改为一次只提出一个变更。",
   BATCH_CONTEXT_UNKNOWN:
     "无法确认同时提出的操作是否完整，必须改为一次只提出一个变更。",
+  BACKUP_UNAVAILABLE:
+    "未能取得这次修改所需的修改前证据，或这一步还会隐式创建上级文件夹；当前版本已停止这一步。请明确选择已有文件夹中的一份普通文件后重试。",
   UNSUPPORTED_TOOL:
     "当前版本不支持这类操作。你可以返回对话，选择一个普通项目文件任务。",
   SENSITIVE_TARGET:
@@ -283,4 +287,79 @@ export function renderReadNotice(
   }
   const label = safeLabel(effect.targetLabel);
   return `正在查看：${label}，不会修改它。`;
+}
+
+export function renderOutcomeCardUpdate(
+  action: ActionFacts,
+  effect: PredictedEffect,
+  report?: VerificationReport,
+): OutcomeCardUpdate {
+  const target = action.targets[0];
+  const consistent = Boolean(
+    target &&
+      target.targetId === effect.targetId &&
+      (!report ||
+        (report.actionId === action.actionId &&
+          report.effectId === effect.effectId &&
+          report.targetId === target.targetId)),
+  );
+  const label = safeLabel(consistent ? effect.targetLabel : "未知文件");
+  if (!report) {
+    return Object.freeze({
+      actionId: action.actionId,
+      state: "executing",
+      lines: Object.freeze([
+        `执行中：正在处理 ${label}。`,
+        "已确认：这次只会核对卡片中列出的这一份文件。",
+        "还不能确认：实际文件结果、实际目标是否达成及程序功能。",
+        "检查范围：仅这份明确文件，不扫描项目。",
+        "恢复：当前不能自动恢复这次修改。",
+      ]),
+    });
+  }
+
+  const state = consistent ? report.status : "unknown";
+  const heading =
+    state === "matched"
+      ? `已确认：${label} 与这次卡片列明的文件结果一致。`
+      : state === "mismatch"
+        ? `不符：${label} 与这次卡片列明的文件结果不一致。`
+        : `无法确认：${label} 的实际文件结果。`;
+  const toolFact =
+    report.toolOutcome === "failed"
+      ? "工具报告失败；文件结论仍来自独立读取，不来自工具返回文本。"
+      : report.toolOutcome === "succeeded"
+        ? "工具报告完成；文件结论仍来自独立读取，不来自工具返回文本。"
+        : "无法确认工具是否完成；不能据此写成“没有执行”。";
+  const reason = new Set(report.reasonCodes);
+  const fileFact =
+    state === "matched"
+      ? "独立读取的内容与全部列明后置条件匹配。"
+      : state === "mismatch"
+        ? reason.has("TARGET_MISSING")
+          ? "列明的目标文件没有出现。"
+          : "独立读取发现了与列明后置条件的明确矛盾。"
+        : reason.has("TARGET_TOO_LARGE") || reason.has("TARGET_GREW_OVER_LIMIT")
+          ? "文件超过本次 10 MiB 观察上限，未继续读取。"
+          : reason.has("RESULT_MISSING") ||
+              reason.has("RESULT_IDENTITY_MISMATCH")
+            ? "没有收到可安全关联到这张卡的完整结果。"
+            : reason.has("POSTCONDITION_INSUFFICIENT")
+              ? "现有编辑语义不足以证明精确结果。"
+              : "无法稳定读取并确认这份文件。";
+  return Object.freeze({
+    actionId: action.actionId,
+    state,
+    lines: Object.freeze([
+      heading,
+      `${report.toolOutcome === "unknown" ? "未确认" : "已知"}：${toolFact}`,
+      `${state === "unknown" ? "未确认" : "已知"}：${fileFact}`,
+      "仍未知：这份文件是否满足你的实际需求，以及程序功能是否正确。",
+      "检查范围：仅独立读取这份明确文件，不扫描项目。",
+      "恢复：当前不能自动恢复这次修改。",
+      state === "matched"
+        ? "下一步：你可以返回 Pi 继续后续文件任务。"
+        : "下一步：请返回 Pi 检查这份文件，再明确提出下一步。",
+    ]),
+  });
 }

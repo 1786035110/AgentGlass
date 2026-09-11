@@ -1,5 +1,6 @@
 import type {
   ActionFacts,
+  PreImageSnapshotEvidence,
   RiskAssessment,
   RiskDecision,
   RiskLevel,
@@ -343,6 +344,39 @@ export function assessRisk(action: ActionFacts): RiskAssessment {
     // Proxy/getter 或规则执行异常都不能把未完成的判断降成 ask/auto_allow，也不泄漏异常文本。
     return failClosed("PREFLIGHT_FAILED");
   }
+}
+
+export function requireMutationBackup(
+  action: ActionFacts,
+  risk: RiskAssessment,
+  snapshot: PreImageSnapshotEvidence,
+): RiskAssessment {
+  if (
+    action.mutatesState !== "yes" ||
+    (snapshot.status === "saved" &&
+      action.impactFacts.createsParentDirectories === "no")
+  ) {
+    return risk;
+  }
+
+  // Beta 变更必须先取得可复核的前像/不存在证据。隐式创建父目录超出单文件证据范围，
+  // 即使目标文件本身可描述也不能继续；展示文案不能把这个 hard-block 降回 ask。
+  const reasonCodes = [...risk.reasonCodes];
+  if (!reasonCodes.includes("BACKUP_UNAVAILABLE")) {
+    const before = reasonCodes.findIndex((code) =>
+      ["FILE_MODIFY", "FILE_CREATE", "KNOWN_READ_ONLY"].includes(code),
+    );
+    reasonCodes.splice(
+      before < 0 ? reasonCodes.length : before,
+      0,
+      "BACKUP_UNAVAILABLE",
+    );
+  }
+  return Object.freeze({
+    level: levelPriority[risk.level] < levelPriority.high ? "high" : risk.level,
+    decision: "hard_block",
+    reasonCodes: Object.freeze(reasonCodes),
+  });
 }
 
 export function assessSiblingMutationRisk(

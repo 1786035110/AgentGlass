@@ -21,6 +21,9 @@ import {
   SettingsManager,
   type ToolCallEvent,
   type ToolDefinition,
+  type ToolExecutionEndEvent,
+  type ToolExecutionStartEvent,
+  type ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -37,6 +40,13 @@ type ToolCall = {
   arguments: Record<string, unknown>;
 };
 type FaultHandler = (event: ToolCallEvent) => void;
+type EventTap = (
+  event:
+    | ToolCallEvent
+    | ToolExecutionStartEvent
+    | ToolResultEvent
+    | ToolExecutionEndEvent,
+) => unknown;
 type ScriptedModel = NonNullable<
   NonNullable<Parameters<typeof createAgentSession>[0]>["model"]
 >;
@@ -140,6 +150,7 @@ interface E2ERuntime {
   }>;
   enqueue(...messages: ModelMessage[]): void;
   setFault(handler: FaultHandler | undefined): void;
+  setEventTap(handler: EventTap | undefined): void;
   streamCalls(): number;
 }
 
@@ -159,14 +170,21 @@ async function createRuntime(options?: {
   }
 
   let fault: FaultHandler | undefined;
+  let eventTap: EventTap | undefined;
   const faultExtensionPath = join(root, "fault-extension.mjs");
   const faultKey = `__agentglassFault${temporaryRoots.length}`;
   Object.assign(globalThis, {
     [faultKey]: (event: ToolCallEvent) => fault?.(event),
+    [`${faultKey}Tap`]: (event: Parameters<EventTap>[0]) => eventTap?.(event),
   });
   await writeFile(
     faultExtensionPath,
-    `export default function (pi) { pi.on("tool_call", (event) => globalThis[${JSON.stringify(faultKey)}]?.(event)); }\n`,
+    `export default function (pi) {
+  pi.on("tool_execution_start", (event) => globalThis[${JSON.stringify(`${faultKey}Tap`)}]?.(event));
+  pi.on("tool_call", (event) => { globalThis[${JSON.stringify(faultKey)}]?.(event); return globalThis[${JSON.stringify(`${faultKey}Tap`)}]?.(event); });
+  pi.on("tool_result", (event) => globalThis[${JSON.stringify(`${faultKey}Tap`)}]?.(event));
+  pi.on("tool_execution_end", (event) => globalThis[${JSON.stringify(`${faultKey}Tap`)}]?.(event));
+}\n`,
     "utf8",
   );
 
@@ -246,6 +264,9 @@ async function createRuntime(options?: {
     setFault: (handler) => {
       fault = handler;
     },
+    setEventTap: (handler) => {
+      eventTap = handler;
+    },
     streamCalls: () => stream.mock.calls.length,
   };
 }
@@ -259,6 +280,7 @@ function installApprovalUi(
   const base = runner.getUIContext();
   const rendered: string[][] = [];
   const statuses: Array<{ key: string; text: string | undefined }> = [];
+  const widgets: Array<{ key: string; content: string[] | undefined }> = [];
   let customCalls = 0;
   const custom = (async <T>(factory: TestCustomFactory<T>) => {
     const step = steps[customCalls++];
@@ -301,12 +323,18 @@ function installApprovalUi(
       ...base,
       custom,
       setStatus: (key, text) => statuses.push({ key, text }),
+      setWidget: (key, content) =>
+        widgets.push({
+          key,
+          content: Array.isArray(content) ? [...content] : undefined,
+        }),
     },
     mode,
   );
   return {
     rendered,
     statuses,
+    widgets,
     get customCalls() {
       return customCalls;
     },
@@ -402,6 +430,27 @@ describe.sequential("A-016 Pi 0.85.1 real dispatch E2E", () => {
       key: "agentglass-read",
       text: "正在查看：活动说明.txt，不会修改它。",
     });
+    expect(ui.statuses).toContainEqual({
+      key: "agentglass-read",
+      text: "已完成这次文件查看；文件内容由 Pi 显示。",
+    });
+    const verificationCards = ui.widgets.filter(
+      ({ key }) => key === "agentglass-action",
+    );
+    expect(verificationCards).toHaveLength(6);
+    expect(
+      verificationCards.filter(({ content }) =>
+        content?.[0]?.startsWith("执行中："),
+      ),
+    ).toHaveLength(3);
+    expect(
+      verificationCards.filter(({ content }) =>
+        content?.[0]?.startsWith("已确认："),
+      ),
+    ).toHaveLength(3);
+    expect(
+      verificationCards.flatMap(({ content }) => content ?? []).join("\n"),
+    ).toContain("当前不能自动恢复");
     expect(await readFile(join(runtime.cwd, "活动说明-副本.txt"), "utf8")).toBe(
       "新活动",
     );
@@ -466,6 +515,8 @@ describe.sequential("A-016 Pi 0.85.1 real dispatch E2E", () => {
 
     for (const fixture of cases) {
       const runtime = await createRuntime();
+      const order: string[] = [];
+      runtime.setEventTap((event) => order.push(event.type));
       const ui = installApprovalUi(runtime, [fixture.step]);
       const target = join(runtime.cwd, `${fixture.name}.txt`);
       await promptCalls(runtime, [
@@ -487,7 +538,140 @@ describe.sequential("A-016 Pi 0.85.1 real dispatch E2E", () => {
         fixture.name,
       ).toBe(fixture.details);
       expect(await exists(target), fixture.name).toBe(fixture.executed);
+      expect(order, fixture.name).toEqual(
+        fixture.executed
+          ? [
+              "tool_execution_start",
+              "tool_call",
+              "tool_result",
+              "tool_execution_end",
+            ]
+          : ["tool_execution_start", "tool_call", "tool_execution_end"],
+      );
     }
+  });
+
+  test("Pi 0.85.1 emits start → tool_call → modifiable tool_result → end, and verification ignores result text", async () => {
+    const runtime = await createRuntime();
+    const order: string[] = [];
+    runtime.setEventTap((event) => {
+      order.push(event.type);
+      if (event.type === "tool_result") {
+        return {
+          content: [{ type: "text", text: "synthetic changed result" }],
+          isError: true,
+        };
+      }
+    });
+    const ui = installApprovalUi(runtime, [
+      { inputs: ["down", "down", "enter"] },
+    ]);
+    await promptCalls(runtime, [
+      {
+        type: "toolCall",
+        id: "result-contract",
+        name: "write",
+        arguments: { path: "contract.txt", content: "expected bytes" },
+      },
+    ]);
+
+    expect(order).toEqual([
+      "tool_execution_start",
+      "tool_call",
+      "tool_result",
+      "tool_execution_end",
+    ]);
+    expect(runtime.executionEnds).toContainEqual({
+      toolCallId: "result-contract",
+      toolName: "write",
+      isError: true,
+    });
+    expect(await readFile(join(runtime.cwd, "contract.txt"), "utf8")).toBe(
+      "expected bytes",
+    );
+    const resultCard = ui.widgets.at(-1)?.content?.join("\n") ?? "";
+    expect(resultCard).toContain("已确认：contract.txt");
+    expect(resultCard).toContain("工具报告失败");
+    expect(resultCard).not.toContain("synthetic changed result");
+  });
+
+  test("product verification reports a tool success whose file bytes were changed before observation", async () => {
+    const runtime = await createRuntime();
+    runtime.setEventTap(async (event) => {
+      if (event.type === "tool_result")
+        await writeFile(join(runtime.cwd, "mismatch.txt"), "different", "utf8");
+    });
+    const ui = installApprovalUi(runtime, [
+      { inputs: ["down", "down", "enter"] },
+    ]);
+    await promptCalls(runtime, [
+      {
+        type: "toolCall",
+        id: "result-mismatch",
+        name: "write",
+        arguments: { path: "mismatch.txt", content: "expected" },
+      },
+    ]);
+    expect(runtime.executionEnds.at(-1)).toMatchObject({ isError: false });
+    expect(ui.widgets.at(-1)?.content?.join("\n")).toContain(
+      "不符：mismatch.txt",
+    );
+  });
+
+  test("locked edit BOM/CRLF semantics match, while an ambiguous edit fails and reports mismatch", async () => {
+    const runtime = await createRuntime();
+    await writeFile(
+      join(runtime.cwd, "crlf.txt"),
+      Buffer.from("\uFEFFfirst “item”\r\nsecond\r\n", "utf8"),
+    );
+    await writeFile(join(runtime.cwd, "ambiguous.txt"), "same\nsame\n", "utf8");
+    const ui = installApprovalUi(runtime, [
+      { inputs: ["down", "down", "enter"] },
+      { inputs: ["down", "down", "enter"] },
+    ]);
+    runtime.enqueue(
+      toolTurn([
+        {
+          type: "toolCall",
+          id: "edit-crlf",
+          name: "edit",
+          arguments: {
+            path: "crlf.txt",
+            edits: [{ oldText: 'first "item"\nsecond', newText: "one\ntwo" }],
+          },
+        },
+      ]),
+      toolTurn([
+        {
+          type: "toolCall",
+          id: "edit-ambiguous",
+          name: "edit",
+          arguments: {
+            path: "ambiguous.txt",
+            edits: [{ oldText: "same", newText: "changed" }],
+          },
+        },
+      ]),
+      finalTurn(),
+    );
+    await runtime.session.prompt("验证编辑语义", {
+      expandPromptTemplates: false,
+    });
+
+    expect(await readFile(join(runtime.cwd, "crlf.txt"), "utf8")).toBe(
+      "\uFEFFone\r\ntwo\r\n",
+    );
+    expect(runtime.executionEnds.map(({ isError }) => isError)).toEqual([
+      false,
+      true,
+    ]);
+    const finalCards = ui.widgets
+      .filter(({ content }) => !content?.[0]?.startsWith("执行中："))
+      .map(({ content }) => content?.[0]);
+    expect(finalCards).toEqual([
+      expect.stringContaining("已确认：crlf.txt"),
+      expect.stringContaining("不符：ambiguous.txt"),
+    ]);
   });
 
   test("no UI and RPC hasUI cannot approve a state-changing action", async () => {
@@ -733,11 +917,9 @@ describe.sequential("A-016 Pi 0.85.1 real dispatch E2E", () => {
     );
   });
 
-  test("snapshot unavailable is disclosed and remains non-recoverable while Alpha approval can continue", async () => {
+  test("B-001 blocks before approval when required snapshot storage is unavailable", async () => {
     const runtime = await createRuntime({ breakSnapshotStorage: true });
-    const ui = installApprovalUi(runtime, [
-      { inputs: ["down", "down", "enter"] },
-    ]);
+    const ui = installApprovalUi(runtime, []);
     await promptCalls(runtime, [
       {
         type: "toolCall",
@@ -747,13 +929,25 @@ describe.sequential("A-016 Pi 0.85.1 real dispatch E2E", () => {
       },
     ]);
 
-    const copy = ui.rendered.flat().join("\n");
-    expect(copy).toContain("未能保存修改前证据");
-    expect(copy).toContain("当前不能自动恢复");
-    expect(copy).not.toMatch(/可以恢复|可撤销|Undo|回滚/u);
-    expect(await readFile(join(runtime.cwd, "degraded.txt"), "utf8")).toBe(
-      "approved",
-    );
+    expect(ui.customCalls).toBe(0);
+    expect(await exists(join(runtime.cwd, "degraded.txt"))).toBe(false);
+    expect(runtime.executionEnds.at(-1)).toMatchObject({ isError: true });
+  });
+
+  test("B-001 blocks implicit parent-directory creation before approval", async () => {
+    const runtime = await createRuntime();
+    const ui = installApprovalUi(runtime, []);
+    await promptCalls(runtime, [
+      {
+        type: "toolCall",
+        id: "implicit-parent",
+        name: "write",
+        arguments: { path: "missing/child.txt", content: "blocked" },
+      },
+    ]);
+    expect(ui.customCalls).toBe(0);
+    expect(await exists(join(runtime.cwd, "missing"))).toBe(false);
+    expect(runtime.executionEnds.at(-1)).toMatchObject({ isError: true });
   });
 
   test("unknown, overridden, unsupported, linked, outside, sensitive, and Critical inputs never execute", async () => {

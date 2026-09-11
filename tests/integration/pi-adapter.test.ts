@@ -158,6 +158,7 @@ function installApprovalUi(
   const base = runner.getUIContext();
   const rendered: string[][] = [];
   const statuses: Array<{ key: string; text: string | undefined }> = [];
+  const widgets: Array<{ key: string; content: string[] | undefined }> = [];
   let customCalls = 0;
   let doneCalls = 0;
   const custom = (async <T>(factory: TestCustomFactory<T>) => {
@@ -205,12 +206,18 @@ function installApprovalUi(
       ...base,
       custom,
       setStatus: (key, text) => statuses.push({ key, text }),
+      setWidget: (key, content) =>
+        widgets.push({
+          key,
+          content: Array.isArray(content) ? [...content] : undefined,
+        }),
     },
     mode,
   );
   return {
     rendered,
     statuses,
+    widgets,
     get customCalls() {
       return customCalls;
     },
@@ -1254,11 +1261,9 @@ test("Pi 0.85.1 exposes every required binding dimension and each changed value 
   }
 });
 
-test("Pi 0.85.1 keeps snapshot downgrade explicit while allowing a fresh TUI approval", async () => {
+test("B-001 hard-blocks a mutation when required snapshot storage is unavailable", async () => {
   const runtime = await createRuntime({ snapshotUnavailable: true });
-  const ui = installApprovalUi(runtime, [
-    { inputs: ["down", "down", "enter"] },
-  ]);
+  const ui = installApprovalUi(runtime, []);
 
   expect(
     await emitCall(runtime, {
@@ -1266,14 +1271,211 @@ test("Pi 0.85.1 keeps snapshot downgrade explicit while allowing a fresh TUI app
       name: "write",
       arguments: { path: "degraded.txt", content: "approved" },
     }),
-  ).toBeUndefined();
+  ).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("修改前证据"),
+  });
   expect(runtime.observed[0]?.preImage).toMatchObject({
     status: "unavailable",
     canRestoreNow: false,
     recoveryGrade: "unknown",
   });
-  const copy = ui.rendered.flat().join("\n");
-  expect(copy).toContain("未能保存修改前证据");
-  expect(copy).toContain("当前不能自动恢复");
-  expect(copy).not.toMatch(/可以恢复|可撤销|Undo|回滚/u);
+  expect(ui.customCalls).toBe(0);
+});
+
+test("B-001 hard-blocks an overwrite whose pre-image exceeds the 10 MiB limit", async () => {
+  const runtime = await createRuntime();
+  const ui = installApprovalUi(runtime, []);
+  await writeFile(
+    join(runtime.cwd, "large.txt"),
+    Buffer.alloc(10 * 1024 * 1024 + 1),
+  );
+  expect(
+    await emitCall(runtime, {
+      id: "large-preimage",
+      name: "write",
+      arguments: { path: "large.txt", content: "replacement" },
+    }),
+  ).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("修改前证据"),
+  });
+  expect(runtime.observed.at(-1)?.preImage).toMatchObject({
+    status: "unavailable",
+    failureCode: "SNAPSHOT_FILE_TOO_LARGE",
+  });
+  expect(ui.customCalls).toBe(0);
+});
+
+test("B-001 correlates one result to one card and rejects duplicate, wrong-order, drifted, missing, and late results", async () => {
+  const runtime = await createRuntime();
+  const ui = installApprovalUi(runtime, [
+    { inputs: ["down", "down", "enter"] },
+    { inputs: ["down", "down", "enter"] },
+    { inputs: ["down", "down", "enter"] },
+  ]);
+  const runner = runtime.session.extensionRunner;
+
+  await runner.emitToolResult({
+    type: "tool_result",
+    toolCallId: "not-started",
+    toolName: "write",
+    input: { path: "ignored.txt", content: "ignored" },
+    content: [{ type: "text", text: "must be ignored" }],
+    details: undefined,
+    isError: false,
+  });
+  expect(ui.widgets).toHaveLength(0);
+
+  const matched = {
+    id: "matched-result",
+    name: "write",
+    arguments: { path: "matched.txt", content: "expected" },
+  };
+  expect(await emitCall(runtime, matched)).toBeUndefined();
+  await writeFile(join(runtime.cwd, "matched.txt"), "expected", "utf8");
+  const resultEvent = {
+    type: "tool_result" as const,
+    toolCallId: matched.id,
+    toolName: "write" as const,
+    input: matched.arguments,
+    content: [{ type: "text" as const, text: "untrusted result" }],
+    details: undefined,
+    isError: false,
+  };
+  await runner.emitToolResult(resultEvent);
+  const afterFirst = ui.widgets.length;
+  expect(ui.widgets.at(-1)?.content?.[0]).toContain("已确认：matched.txt");
+  await runner.emitToolResult(resultEvent);
+  expect(ui.widgets).toHaveLength(afterFirst);
+  expect(JSON.stringify(ui.widgets)).not.toContain("untrusted result");
+  await runner.emit({
+    type: "tool_execution_end",
+    toolCallId: matched.id,
+    toolName: "write",
+    result: {},
+    isError: false,
+  });
+
+  const drifted = {
+    id: "drifted-result",
+    name: "write",
+    arguments: { path: "drifted.txt", content: "expected" },
+  };
+  expect(await emitCall(runtime, drifted)).toBeUndefined();
+  await writeFile(join(runtime.cwd, "drifted.txt"), "expected", "utf8");
+  await runner.emitToolResult({
+    ...resultEvent,
+    toolCallId: drifted.id,
+    input: { path: "other.txt", content: "expected" },
+  });
+  expect(ui.widgets.at(-1)?.content?.[0]).toContain("无法确认：drifted.txt");
+  await runner.emit({
+    type: "tool_execution_end",
+    toolCallId: drifted.id,
+    toolName: "write",
+    result: {},
+    isError: false,
+  });
+
+  const missing = {
+    id: "missing-result",
+    name: "write",
+    arguments: { path: "missing-result.txt", content: "expected" },
+  };
+  expect(await emitCall(runtime, missing)).toBeUndefined();
+  const beforeWrongEnd = ui.widgets.length;
+  await runner.emit({
+    type: "tool_execution_end",
+    toolCallId: missing.id,
+    toolName: "edit",
+    result: {},
+    isError: false,
+  });
+  expect(ui.widgets).toHaveLength(beforeWrongEnd);
+  await runner.emit({
+    type: "tool_execution_end",
+    toolCallId: missing.id,
+    toolName: "write",
+    result: { content: [{ type: "text", text: "not inspected" }] },
+    isError: false,
+  });
+  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain(
+    "无法确认工具是否完成",
+  );
+  expect(JSON.stringify(ui.widgets)).not.toContain("not inspected");
+
+  const lifecycle = await createRuntime();
+  const lifecycleUi = installApprovalUi(lifecycle, [
+    { inputs: ["down", "down", "enter"] },
+  ]);
+  const late = {
+    id: "late-result",
+    name: "write",
+    arguments: { path: "late.txt", content: "expected" },
+  };
+  expect(await emitCall(lifecycle, late)).toBeUndefined();
+  await lifecycle.session.extensionRunner.emit({
+    type: "session_shutdown",
+    reason: "quit",
+  });
+  const beforeLate = lifecycleUi.widgets.length;
+  await lifecycle.session.extensionRunner.emitToolResult({
+    ...resultEvent,
+    toolCallId: late.id,
+    input: late.arguments,
+  });
+  expect(lifecycleUi.widgets).toHaveLength(beforeLate);
+
+  const ended = await createRuntime();
+  const endedUi = installApprovalUi(ended, [
+    { inputs: ["down", "down", "enter"] },
+  ]);
+  const endedCall = {
+    id: "agent-ended",
+    name: "write",
+    arguments: { path: "ended.txt", content: "expected" },
+  };
+  expect(await emitCall(ended, endedCall)).toBeUndefined();
+  await ended.session.extensionRunner.emit({ type: "agent_end", messages: [] });
+  expect(endedUi.widgets.at(-1)?.content?.join("\n")).toContain(
+    "无法确认工具是否完成",
+  );
+  const afterEnd = endedUi.widgets.length;
+  await ended.session.extensionRunner.emitToolResult({
+    ...resultEvent,
+    toolCallId: endedCall.id,
+    input: endedCall.arguments,
+  });
+  expect(endedUi.widgets).toHaveLength(afterEnd);
+});
+
+test("B-001 keeps repeated read feedback on one status key", async () => {
+  const runtime = await createRuntime();
+  const ui = installApprovalUi(runtime, []);
+  await writeFile(join(runtime.cwd, "read.txt"), "content", "utf8");
+  for (const id of ["read-one", "read-two"]) {
+    const call = { id, name: "read", arguments: { path: "read.txt" } };
+    expect(await emitCall(runtime, call)).toBeUndefined();
+    await runtime.session.extensionRunner.emitToolResult({
+      type: "tool_result",
+      toolCallId: id,
+      toolName: "read",
+      input: call.arguments,
+      content: [{ type: "text", text: "content" }],
+      details: undefined,
+      isError: false,
+    });
+    await runtime.session.extensionRunner.emit({
+      type: "tool_execution_end",
+      toolCallId: id,
+      toolName: "read",
+      result: {},
+      isError: false,
+    });
+  }
+  expect(new Set(ui.statuses.map(({ key }) => key))).toEqual(
+    new Set(["agentglass-read"]),
+  );
+  expect(ui.widgets).toHaveLength(0);
 });

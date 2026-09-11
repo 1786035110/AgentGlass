@@ -75,6 +75,7 @@ test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", asy
       "session_start",
       "tool_call",
       "tool_execution_end",
+      "tool_result",
     ]);
   } finally {
     await rm(temporary, { recursive: true, force: true });

@@ -1,6 +1,5 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
 import {
   chmod,
   lstat,
@@ -18,6 +17,7 @@ import type {
   PreImageSnapshotEvidence,
   SnapshotFailureCode,
 } from "./domain.js";
+import { readStableFile, StableFileReadError } from "./stable-file.js";
 
 export const SNAPSHOT_FILE_LIMIT_BYTES = 10 * 1024 * 1024;
 export const SNAPSHOT_TOTAL_LIMIT_BYTES = 100 * 1024 * 1024;
@@ -250,43 +250,17 @@ async function readBounded(
   bytes: Buffer;
   stats: Awaited<ReturnType<typeof lstat>>;
 }> {
-  const before = await lstat(targetPath);
-  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1)
-    fail("SNAPSHOT_TARGET_UNSUPPORTED");
-  if (before.size > limit) fail("SNAPSHOT_FILE_TOO_LARGE");
-
-  const flags =
-    process.platform === "win32"
-      ? constants.O_RDONLY
-      : constants.O_RDONLY | constants.O_NOFOLLOW;
-  const handle = await open(targetPath, flags);
   try {
-    const opened = await handle.stat();
-    if (!opened.isFile() || opened.nlink !== 1 || !sameFile(before, opened))
-      fail("SNAPSHOT_TARGET_CHANGED");
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for (;;) {
-      const buffer = Buffer.allocUnsafe(64 * 1024);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      total += bytesRead;
-      if (total > limit) fail("SNAPSHOT_FILE_TOO_LARGE");
-      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+    const observed = await readStableFile(targetPath, limit);
+    return { bytes: observed.bytes, stats: observed.stats };
+  } catch (error) {
+    if (error instanceof StableFileReadError) {
+      if (error.code === "too_large" || error.code === "grew_over_limit")
+        fail("SNAPSHOT_FILE_TOO_LARGE");
+      if (error.code === "unsupported") fail("SNAPSHOT_TARGET_UNSUPPORTED");
+      if (error.code === "changed") fail("SNAPSHOT_TARGET_CHANGED");
     }
-    const after = await handle.stat();
-    if (
-      !sameFile(opened, after) ||
-      after.size !== total ||
-      after.mtimeMs !== opened.mtimeMs ||
-      after.ctimeMs !== opened.ctimeMs ||
-      after.mode !== opened.mode
-    ) {
-      fail("SNAPSHOT_TARGET_CHANGED");
-    }
-    return { bytes: Buffer.concat(chunks, total), stats: after };
-  } finally {
-    await handle.close();
+    throw error;
   }
 }
 

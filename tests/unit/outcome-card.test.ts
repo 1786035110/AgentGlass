@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import type { PreImageSnapshotEvidence } from "../../src/core/domain.js";
 import {
   renderOutcomeCard,
+  renderOutcomeCardUpdate,
   renderReadNotice,
 } from "../../src/core/outcome-card.js";
 import { predictEffects } from "../../src/core/predicted-effects.js";
@@ -25,6 +26,52 @@ test("A-011 local zh-CN templates match every specified fixture", () => {
 
   expect(renderedCopy).toMatchSnapshot();
 });
+
+test.each([
+  ["matched", "已确认：", "工具报告完成"],
+  ["mismatch", "不符：", "工具报告失败"],
+  ["unknown", "无法确认：", "无法确认工具是否完成"],
+] as const)(
+  "B-001 keeps %s feedback on the same logical card",
+  (status, heading, toolFact) => {
+    const action = actionFacts({
+      kind: "edit",
+      mutatesState: "yes",
+      impactFacts: { effect: "edit", createsParentDirectories: "no" },
+    });
+    const effect = predictEffects(action, assessRisk(action))[0];
+    if (!effect) throw new Error("effect missing");
+    const update = renderOutcomeCardUpdate(action, effect, {
+      actionId: action.actionId,
+      effectId: effect.effectId,
+      targetId: effect.targetId,
+      status,
+      toolOutcome:
+        status === "matched"
+          ? "succeeded"
+          : status === "mismatch"
+            ? "failed"
+            : "unknown",
+      reasonCodes: [
+        status === "matched"
+          ? "POSTCONDITION_MATCHED"
+          : status === "mismatch"
+            ? "POSTCONDITION_MISMATCH"
+            : "RESULT_MISSING",
+      ],
+      checkScope: "single_file",
+      applicationOutcome: "unverifiable",
+    });
+    const text = update.lines.join("\n");
+    expect(update.actionId).toBe(action.actionId);
+    expect(text).toContain(heading);
+    expect(text).toContain(toolFact);
+    expect(text).toContain("仅独立读取这份明确文件");
+    expect(text).toContain("程序功能是否正确");
+    expect(text).toContain("当前不能自动恢复");
+    expect(text).not.toMatch(/可以恢复|Undo|回滚/u);
+  },
+);
 
 test("A-011 ordinary read has one mergeable non-mutating notice", () => {
   const fixture = outcomeCardFixtures.find(
