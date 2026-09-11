@@ -12,7 +12,10 @@ import { afterEach, expect, test, vi } from "vitest";
 import { classifyFileAction } from "../../src/core/file-classification.js";
 import {
   capturePreImageSnapshot,
+  finalizeRecoverySnapshot,
   noPreImageSnapshot,
+  recoveryEntryIsCurrent,
+  restoreRecoveryEntry,
   unavailablePreImageSnapshot,
 } from "../../src/core/pre-image-snapshot.js";
 
@@ -24,6 +27,35 @@ afterEach(async () => {
       .splice(0)
       .map((directory) => rm(directory, { recursive: true, force: true })),
   );
+});
+
+test("INV-003/005/020: restore keeps secret bytes in the sensitive domain and blocks drift", async () => {
+  const { workspace, snapshotRoot } = await setup();
+  const secret = "synthetic-private-preimage-value";
+  const targetPath = path.join(workspace, "restore-secret.txt");
+  await writeFile(targetPath, secret, "utf8");
+  const snapshot = await capturePreImageSnapshot(snapshotRoot, {
+    actionId: "secret-restore-action",
+    targetId: "secret-restore-target",
+    targetPath,
+    targetExisted: true,
+  });
+  await writeFile(targetPath, "after", "utf8");
+  const ready = await finalizeRecoverySnapshot(
+    snapshotRoot,
+    snapshot,
+    "secret-restore-effect",
+    "f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8",
+    5,
+  );
+  if (!ready) throw new Error("ready recovery missing");
+  expect(JSON.stringify(ready)).not.toContain(secret);
+  expect(await recoveryEntryIsCurrent(snapshotRoot, ready)).toBe(true);
+  await writeFile(targetPath, "later", "utf8");
+  expect(await restoreRecoveryEntry(snapshotRoot, ready)).toMatchObject({
+    status: "conflict",
+  });
+  expect(await readFile(targetPath, "utf8")).toBe("later");
 });
 
 async function setup() {

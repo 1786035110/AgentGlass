@@ -1,11 +1,13 @@
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readdir,
   readFile,
   rm,
   truncate,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +15,11 @@ import path from "node:path";
 import { afterEach, expect, test } from "vitest";
 import {
   capturePreImageSnapshot,
+  cleanSnapshotSet,
+  finalizeRecoverySnapshot,
+  inspectCleanupSet,
+  recoveryEntryIsCurrent,
+  restoreRecoveryEntry,
   SNAPSHOT_ENTRY_LIMIT,
   SNAPSHOT_FILE_LIMIT_BYTES,
   SNAPSHOT_TOTAL_LIMIT_BYTES,
@@ -70,23 +77,23 @@ test("captures an existing regular file, its identity, bytes, and permissions", 
   });
   const saved = await manifest(snapshotRoot, result.snapshotId);
   expect(saved).toMatchObject({
-    schemaVersion: 1,
-    kind: "agentglass-pre-image",
+    schemaVersion: 2,
+    kind: "agentglass-single-file-recovery",
+    state: "prepared",
     actionId: "action-existing",
     targetId: "target-existing",
     targetPath,
     targetExisted: true,
-    fileIdentity: { device: expect.any(String), inode: expect.any(String) },
-    permissions: {
+    preIdentity: { device: expect.any(String), inode: expect.any(String) },
+    prePermissions: {
       platform: process.platform,
       mode: expect.any(Number),
       uid: expect.any(String),
       gid: expect.any(String),
     },
-    canRestoreNow: false,
-    recoveryGrade: "unknown",
+    postImage: null,
   });
-  const permissions = saved.permissions as { acl: unknown };
+  const permissions = saved.prePermissions as { acl: unknown };
   expect(permissions.acl).toEqual(
     process.platform === "win32"
       ? { format: "sddl", value: expect.any(String) }
@@ -119,11 +126,307 @@ test("records a new file as not existing without inventing permissions", async (
   expect(await manifest(snapshotRoot, result.snapshotId)).toMatchObject({
     targetExisted: false,
     preImage: null,
-    fileIdentity: null,
-    permissions: null,
-    canRestoreNow: false,
-    recoveryGrade: "unknown",
+    preIdentity: null,
+    prePermissions: null,
+    postImage: null,
   });
+});
+
+test("B-002 restores an overwritten file only while its post-image is unchanged", async () => {
+  const { workspace, snapshotRoot } = await setup();
+  const targetPath = path.join(workspace, "restore.txt");
+  await writeFile(targetPath, "before", "utf8");
+  if (process.platform !== "win32") await chmod(targetPath, 0o640);
+  const snapshot = await capturePreImageSnapshot(snapshotRoot, {
+    actionId: "restore-action",
+    targetId: "restore-target",
+    targetPath,
+    targetExisted: true,
+  });
+  await writeFile(targetPath, "after", "utf8");
+  const ready = await finalizeRecoverySnapshot(
+    snapshotRoot,
+    snapshot,
+    "restore-effect",
+    "f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8",
+    5,
+  );
+  expect(ready).toBeDefined();
+  if (!ready) throw new Error("recovery was not finalized");
+  expect(await recoveryEntryIsCurrent(snapshotRoot, ready)).toBe(true);
+  expect(await restoreRecoveryEntry(snapshotRoot, ready)).toEqual({
+    status: "restored",
+    content: "matched",
+    permissions: "matched",
+  });
+  expect(await readFile(targetPath, "utf8")).toBe("before");
+  expect(await recoveryEntryIsCurrent(snapshotRoot, ready)).toBe(false);
+});
+
+test("B-002 deletes only the proven newly created file and preserves drift", async () => {
+  const first = await setup();
+  const createdPath = path.join(first.workspace, "created.txt");
+  const createdSnapshot = await capturePreImageSnapshot(first.snapshotRoot, {
+    actionId: "create-action",
+    targetId: "create-target",
+    targetPath: createdPath,
+    targetExisted: false,
+  });
+  await writeFile(createdPath, "created", "utf8");
+  const created = await finalizeRecoverySnapshot(
+    first.snapshotRoot,
+    createdSnapshot,
+    "create-effect",
+    "406effb1e9c59672c66a598c2b21e331b23b16c54024e96d6df3e7c173549791",
+    7,
+  );
+  if (!created) throw new Error("creation recovery missing");
+  expect(await restoreRecoveryEntry(first.snapshotRoot, created)).toEqual({
+    status: "restored",
+    content: "missing",
+    permissions: "not_applicable",
+  });
+  await expect(readFile(createdPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+  const second = await setup();
+  const driftPath = path.join(second.workspace, "drift.txt");
+  await writeFile(driftPath, "before", "utf8");
+  const driftSnapshot = await capturePreImageSnapshot(second.snapshotRoot, {
+    actionId: "drift-action",
+    targetId: "drift-target",
+    targetPath: driftPath,
+    targetExisted: true,
+  });
+  await writeFile(driftPath, "after", "utf8");
+  const drift = await finalizeRecoverySnapshot(
+    second.snapshotRoot,
+    driftSnapshot,
+    "drift-effect",
+    "f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8",
+    5,
+  );
+  if (!drift) throw new Error("drift recovery missing");
+  await writeFile(driftPath, "later edit", "utf8");
+  expect(await restoreRecoveryEntry(second.snapshotRoot, drift)).toMatchObject({
+    status: "conflict",
+  });
+  expect(await readFile(driftPath, "utf8")).toBe("later edit");
+});
+
+test("B-002 cleanup binds the verified set and preserves corrupt/future data", async () => {
+  const { workspace, snapshotRoot } = await setup();
+  const targetPath = path.join(workspace, "clean.txt");
+  await writeFile(targetPath, "before", "utf8");
+  const legacySnapshot = await capturePreImageSnapshot(snapshotRoot, {
+    actionId: "clean-action",
+    targetId: "clean-target",
+    targetPath,
+    targetExisted: true,
+  });
+  if (!legacySnapshot.snapshotId) throw new Error("legacy snapshot missing");
+  const legacyPath = path.join(
+    snapshotRoot,
+    `${legacySnapshot.snapshotId}.manifest.json`,
+  );
+  const versionTwo = JSON.parse(await readFile(legacyPath, "utf8"));
+  await writeFile(
+    legacyPath,
+    JSON.stringify({
+      schemaVersion: 1,
+      kind: "agentglass-pre-image",
+      snapshotId: versionTwo.snapshotId,
+      actionId: versionTwo.actionId,
+      targetId: versionTwo.targetId,
+      targetPath: versionTwo.targetPath,
+      targetExisted: versionTwo.targetExisted,
+      preImage: versionTwo.preImage,
+      fileIdentity: versionTwo.preIdentity,
+      permissions: versionTwo.prePermissions,
+      canRestoreNow: false,
+      recoveryGrade: "unknown",
+    }),
+    "utf8",
+  );
+  const interrupted = path.join(
+    snapshotRoot,
+    ".00000000-0000-4000-8000-000000000002.manifest.json.tmp",
+  );
+  await writeFile(interrupted, "incomplete", "utf8");
+  const corrupt = path.join(
+    snapshotRoot,
+    "00000000-0000-4000-8000-000000000000.manifest.json",
+  );
+  await writeFile(corrupt, "{broken", "utf8");
+  const approved = await inspectCleanupSet(snapshotRoot);
+  expect(approved.fileCount).toBe(2);
+  await capturePreImageSnapshot(snapshotRoot, {
+    actionId: "changed-clean-action",
+    targetId: "changed-clean-target",
+    targetPath: path.join(workspace, "not-created.txt"),
+    targetExisted: false,
+  });
+  expect(await cleanSnapshotSet(snapshotRoot, approved)).toEqual({
+    deleted: 0,
+    failed: 0,
+    changed: true,
+    deletedFiles: [],
+  });
+  const current = await inspectCleanupSet(snapshotRoot);
+  expect(current.fileCount).toBe(3);
+  await writeFile(
+    path.join(
+      snapshotRoot,
+      "00000000-0000-4000-8000-000000000001.manifest.json",
+    ),
+    JSON.stringify({ schemaVersion: 99 }),
+    "utf8",
+  );
+  expect(await cleanSnapshotSet(snapshotRoot, current)).toMatchObject({
+    deleted: 3,
+    failed: 0,
+    changed: false,
+  });
+  expect(await readFile(corrupt, "utf8")).toBe("{broken");
+  expect(await readFile(interrupted, "utf8")).toBe("incomplete");
+});
+
+test("B-002 refuses schema v1, future, corrupt, and prepared-only data as recovery authorization", async () => {
+  for (const replacement of [
+    { schemaVersion: 1, kind: "agentglass-pre-image" },
+    { schemaVersion: 99, kind: "agentglass-single-file-recovery" },
+    "{broken",
+  ]) {
+    const { workspace, snapshotRoot } = await setup();
+    const targetPath = path.join(workspace, "versioned.txt");
+    await writeFile(targetPath, "before", "utf8");
+    const snapshot = await capturePreImageSnapshot(snapshotRoot, {
+      actionId: "version-action",
+      targetId: "version-target",
+      targetPath,
+      targetExisted: true,
+    });
+    if (!snapshot.snapshotId) throw new Error("snapshot missing");
+    const manifestPath = path.join(
+      snapshotRoot,
+      `${snapshot.snapshotId}.manifest.json`,
+    );
+    if (typeof replacement === "string") {
+      await writeFile(manifestPath, replacement, "utf8");
+    } else {
+      const original = JSON.parse(await readFile(manifestPath, "utf8"));
+      await writeFile(
+        manifestPath,
+        JSON.stringify({ ...original, ...replacement }),
+        "utf8",
+      );
+    }
+    await writeFile(targetPath, "after", "utf8");
+    expect(
+      await finalizeRecoverySnapshot(
+        snapshotRoot,
+        snapshot,
+        "version-effect",
+        "f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8",
+        5,
+      ),
+    ).toBeUndefined();
+  }
+});
+
+test("B-002 cleanup reports partial deletion and retains the failed item", async () => {
+  const { workspace, snapshotRoot } = await setup();
+  const targetPath = path.join(workspace, "partial.txt");
+  await writeFile(targetPath, "before", "utf8");
+  await capturePreImageSnapshot(snapshotRoot, {
+    actionId: "partial-action",
+    targetId: "partial-target",
+    targetPath,
+    targetExisted: true,
+  });
+  const approved = await inspectCleanupSet(snapshotRoot);
+  let attempt = 0;
+  const result = await cleanSnapshotSet(
+    snapshotRoot,
+    approved,
+    async (filePath) => {
+      attempt += 1;
+      if (attempt === 2) throw new Error("synthetic deletion failure");
+      await unlink(filePath);
+    },
+  );
+  expect(result).toMatchObject({ deleted: 1, failed: 1, changed: false });
+  expect(await readdir(snapshotRoot)).toHaveLength(1);
+});
+
+test("B-002 consumes a failed restore without retrying or recreating authorization", async () => {
+  const { workspace, snapshotRoot } = await setup();
+  const targetPath = path.join(workspace, "failed-restore.txt");
+  await writeFile(targetPath, "before", "utf8");
+  const snapshot = await capturePreImageSnapshot(snapshotRoot, {
+    actionId: "failed-restore-action",
+    targetId: "failed-restore-target",
+    targetPath,
+    targetExisted: true,
+  });
+  await writeFile(targetPath, "after", "utf8");
+  const ready = await finalizeRecoverySnapshot(
+    snapshotRoot,
+    snapshot,
+    "failed-restore-effect",
+    "f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8",
+    5,
+  );
+  if (!ready) throw new Error("ready recovery missing");
+  await unlink(path.join(snapshotRoot, `${ready.snapshotId}.preimage`));
+  expect(await restoreRecoveryEntry(snapshotRoot, ready)).toMatchObject({
+    status: "failed",
+    content: "unknown",
+  });
+  expect(await readFile(targetPath, "utf8")).toBe("after");
+  expect(await recoveryEntryIsCurrent(snapshotRoot, ready)).toBe(false);
+});
+
+test("B-002 rejects identity, link, and permission drift before restore", async () => {
+  const makeReady = async (name: string) => {
+    const fixture = await setup();
+    const targetPath = path.join(fixture.workspace, `${name}.txt`);
+    await writeFile(targetPath, "before", "utf8");
+    const snapshot = await capturePreImageSnapshot(fixture.snapshotRoot, {
+      actionId: `${name}-action`,
+      targetId: `${name}-target`,
+      targetPath,
+      targetExisted: true,
+    });
+    await writeFile(targetPath, "after", "utf8");
+    const ready = await finalizeRecoverySnapshot(
+      fixture.snapshotRoot,
+      snapshot,
+      `${name}-effect`,
+      "f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8",
+      5,
+    );
+    if (!ready) throw new Error("ready recovery missing");
+    return { ...fixture, targetPath, ready };
+  };
+
+  const identity = await makeReady("identity");
+  await unlink(identity.targetPath);
+  await writeFile(identity.targetPath, "after", "utf8");
+  expect(
+    await recoveryEntryIsCurrent(identity.snapshotRoot, identity.ready),
+  ).toBe(false);
+
+  const linked = await makeReady("linked");
+  await link(linked.targetPath, path.join(linked.workspace, "alias.txt"));
+  expect(await recoveryEntryIsCurrent(linked.snapshotRoot, linked.ready)).toBe(
+    false,
+  );
+
+  const permissions = await makeReady("permissions");
+  await chmod(permissions.targetPath, 0o444);
+  expect(
+    await recoveryEntryIsCurrent(permissions.snapshotRoot, permissions.ready),
+  ).toBe(false);
 });
 
 test("approval baseline rejects a changed existing file or newly appeared file", async () => {

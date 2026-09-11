@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   EditToolInput,
   ExtensionAPI,
@@ -25,6 +25,7 @@ import type {
   ObservableUserGoal,
   OutcomeCard,
   PredictedEffect,
+  PreImageSnapshotEvidence,
   RiskAssessment,
   SiblingExecutionReference,
   TransientHostExecutionInput,
@@ -48,6 +49,13 @@ import {
 } from "../../core/outcome-card.js";
 import {
   capturePreImageSnapshot,
+  cleanSnapshotSet,
+  finalizeRecoverySnapshot,
+  inspectCleanupSet,
+  markRecoveryState,
+  type RecoveryEntry,
+  recoveryEntryIsCurrent,
+  restoreRecoveryEntry,
   unavailablePreImageSnapshot,
   verifyPreImageSnapshotBaseline,
 } from "../../core/pre-image-snapshot.js";
@@ -88,7 +96,14 @@ interface PendingVerification {
   effect: PredictedEffect;
   targetPath: string;
   expected: ExpectedFilePostcondition;
+  preImage: PreImageSnapshotEvidence;
   inFlight: boolean;
+}
+
+interface SessionRecoveryEntry extends RecoveryEntry {
+  sessionId: string;
+  cwd: string;
+  targetLabel: string;
 }
 
 const knownBuiltinNames = new Set([
@@ -609,6 +624,7 @@ export function registerPiAdapter(
   >();
   const pendingTokens = new Set<ApprovalToken>();
   const pendingApprovalCancels = new Set<() => void>();
+  let latestRecovery: SessionRecoveryEntry | undefined;
   let runGeneration = 0;
 
   const clearRun = (ctx?: ExtensionContext): void => {
@@ -698,8 +714,262 @@ export function registerPiAdapter(
     }
   };
 
+  const internalBinding = (
+    toolName: "agentglass.restore" | "agentglass.cleanup",
+    ctx: ExtensionContext,
+    toolCallId: string,
+    payload: Record<string, unknown>,
+  ): Readonly<ExecutionBinding> => {
+    const currentSession = ctx.sessionManager.getSessionId();
+    if (!nonEmptyString(currentSession) || !nonEmptyString(ctx.cwd))
+      throw new Error();
+    return Object.freeze({
+      fingerprint: fingerprintTransientActionInput(toolName, payload),
+      toolName,
+      cwd: ctx.cwd,
+      sessionId: currentSession,
+      hostExecutionId: hostExecutionId(currentSession, toolCallId),
+      toolCallId,
+    });
+  };
+
+  const notify = (
+    ctx: ExtensionContext,
+    message: string,
+    type: "info" | "warning" | "error" = "info",
+  ): void => {
+    try {
+      ctx.ui.notify(message, type);
+    } catch {
+      // UI 失败不改变恢复或清理状态，也不回显异常。
+    }
+  };
+
+  pi.registerCommand("agentglass", {
+    description: "查看或使用最近一次单文件恢复，并管理本地恢复数据",
+    handler: async (args, ctx) => {
+      let commandSession: string | undefined;
+      try {
+        const current = ctx.sessionManager.getSessionId();
+        commandSession = nonEmptyString(current) ? current : undefined;
+      } catch {
+        commandSession = undefined;
+      }
+      // 恢复许可只属于创建它的会话与 cwd；一旦观察到边界切换便立即丢弃内存入口，
+      // 防止用户切回旧环境后让已经失效的入口“复活”。磁盘证据仍留给单独审批的清理。
+      if (
+        latestRecovery &&
+        (latestRecovery.sessionId !== commandSession ||
+          latestRecovery.cwd !== ctx.cwd)
+      ) {
+        latestRecovery = undefined;
+      }
+      if (ctx.mode !== "tui" || !ctx.hasUI) {
+        notify(ctx, APPROVAL_UNAVAILABLE_REASON, "warning");
+        return;
+      }
+      let action = args.trim().toLowerCase();
+      if (!action) {
+        const choice = await ctx.ui.select("AgentGlass", [
+          ...(latestRecovery ? ["恢复最近一次修改"] : []),
+          "清理本地恢复数据",
+          "关闭",
+        ]);
+        action =
+          choice === "恢复最近一次修改"
+            ? "restore"
+            : choice === "清理本地恢复数据"
+              ? "cleanup"
+              : "";
+      }
+      if (action === "restore" || action === "恢复") {
+        const entry = latestRecovery;
+        if (
+          !entry ||
+          entry.sessionId !== commandSession ||
+          entry.cwd !== ctx.cwd ||
+          !(await recoveryEntryIsCurrent(snapshotRoot, entry))
+        ) {
+          if (entry && latestRecovery === entry) latestRecovery = undefined;
+          notify(
+            ctx,
+            entry
+              ? "已停止：当前文件与这次修改完成后的记录不一致，已保留当前内容。"
+              : "当前会话没有可用的最近恢复项。",
+            "warning",
+          );
+          return;
+        }
+        const callId = randomUUID();
+        const payload = {
+          snapshotId: entry.snapshotId,
+          actionId: entry.actionId,
+        };
+        const binding = internalBinding(
+          "agentglass.restore",
+          ctx,
+          callId,
+          payload,
+        );
+        const token = issueApprovalToken(callId, binding);
+        pendingTokens.add(token);
+        const card: OutcomeCard = Object.freeze({
+          actionId: callId,
+          title: entry.targetExisted
+            ? `下一步：恢复 ${entry.targetLabel}`
+            : `下一步：删除刚才创建的 ${entry.targetLabel}`,
+          expectedOutcome: entry.targetExisted
+            ? `预计结果：将用修改前副本替换 ${entry.targetLabel} 的当前内容。`
+            : `预计结果：将删除这次修改创建的 ${entry.targetLabel}。`,
+          attention:
+            "需要注意：这是新的单文件变更；继续后本恢复入口会被单次消费，失败也不会自动重试。",
+          recovery: "恢复后会独立核对文件内容、存在状态和受支持权限。",
+          details: [
+            `位置：当前项目内的 ${entry.targetLabel}。`,
+            "如果路径、身份、字节或权限已变化，将停止并保留当前文件。",
+          ],
+        });
+        const choice = await requestOutcomeApproval(
+          ctx,
+          card,
+          pendingApprovalCancels,
+        );
+        if (choice !== "continue") {
+          invalidateApprovalToken(token);
+          pendingTokens.delete(token);
+          notify(ctx, "已停止：未批准恢复，文件和恢复入口均保留。");
+          return;
+        }
+        if (
+          latestRecovery !== entry ||
+          !(await recoveryEntryIsCurrent(snapshotRoot, entry))
+        ) {
+          if (latestRecovery === entry) latestRecovery = undefined;
+          invalidateApprovalToken(token);
+          pendingTokens.delete(token);
+          notify(ctx, "已停止：批准期间恢复依据或当前文件已变化。", "warning");
+          return;
+        }
+        const finalBinding = internalBinding(
+          "agentglass.restore",
+          ctx,
+          callId,
+          payload,
+        );
+        if (!consumeApprovalToken(token, callId, finalBinding)) {
+          pendingTokens.delete(token);
+          notify(ctx, APPROVAL_CHANGED_REASON, "warning");
+          return;
+        }
+        pendingTokens.delete(token);
+        latestRecovery = undefined;
+        const result = await restoreRecoveryEntry(snapshotRoot, entry);
+        setActionCard(ctx, {
+          actionId: callId,
+          state:
+            result.status === "restored"
+              ? "matched"
+              : result.status === "conflict"
+                ? "mismatch"
+                : "unknown",
+          lines: Object.freeze([
+            result.status === "restored"
+              ? `已确认：${entry.targetLabel} 已恢复到这次修改之前。`
+              : result.status === "conflict"
+                ? `已停止：${entry.targetLabel} 已变化，保留当前文件。`
+                : `无法确认：${entry.targetLabel} 的恢复结果。`,
+            `内容/存在状态：${result.content === "matched" ? "已匹配修改前副本" : result.content === "missing" ? "已确认文件不存在" : "未确认"}。`,
+            `权限：${result.permissions === "matched" ? "已匹配记录" : result.permissions === "not_applicable" ? "不适用" : "未确认"}。`,
+            "这次恢复入口已消费；不会自动重试或创建 redo。",
+          ]),
+        });
+        return;
+      }
+
+      if (action === "cleanup" || action === "清理") {
+        const cleanup = await inspectCleanupSet(snapshotRoot);
+        if (cleanup.fileCount === 0) {
+          notify(ctx, "没有可验证归属且可清理的 AgentGlass 恢复数据。");
+          return;
+        }
+        const callId = randomUUID();
+        const binding = internalBinding("agentglass.cleanup", ctx, callId, {
+          fingerprint: cleanup.fingerprint,
+          fileCount: cleanup.fileCount,
+          logicalBytes: cleanup.logicalBytes,
+        });
+        const token = issueApprovalToken(callId, binding);
+        pendingTokens.add(token);
+        const choice = await requestOutcomeApproval(
+          ctx,
+          Object.freeze({
+            actionId: callId,
+            title: "下一步：清理 AgentGlass 本地恢复数据",
+            expectedOutcome: `预计结果：删除 ${cleanup.fileCount} 个已验证私有文件，共 ${cleanup.logicalBytes} 字节。`,
+            attention: `需要注意：${latestRecovery ? "当前最近一次恢复能力也会丢失。" : "删除后这些副本不能用于恢复。"}`,
+            recovery: "清理失败时会保留未删项并报告实际结果。",
+            details: [
+              "只处理经私有根目录、manifest schema 和引用关系验证的文件。",
+              "损坏、未来版本或无法验证归属的数据会保留。",
+            ],
+          }),
+          pendingApprovalCancels,
+        );
+        if (choice !== "continue") {
+          invalidateApprovalToken(token);
+          pendingTokens.delete(token);
+          notify(ctx, "已停止：未批准清理，本地数据未删除。");
+          return;
+        }
+        const current = await inspectCleanupSet(snapshotRoot);
+        const finalBinding = internalBinding(
+          "agentglass.cleanup",
+          ctx,
+          callId,
+          {
+            fingerprint: cleanup.fingerprint,
+            fileCount: cleanup.fileCount,
+            logicalBytes: cleanup.logicalBytes,
+          },
+        );
+        if (
+          current.fingerprint !== cleanup.fingerprint ||
+          !consumeApprovalToken(token, callId, finalBinding)
+        ) {
+          invalidateApprovalToken(token);
+          pendingTokens.delete(token);
+          notify(
+            ctx,
+            "已停止：批准期间待清理集合已变化，未删除任何数据。",
+            "warning",
+          );
+          return;
+        }
+        pendingTokens.delete(token);
+        const result = await cleanSnapshotSet(snapshotRoot, cleanup);
+        const activeSnapshotId = latestRecovery?.snapshotId;
+        if (
+          activeSnapshotId &&
+          result.deletedFiles.some((file) =>
+            file.startsWith(`${activeSnapshotId}.`),
+          )
+        ) {
+          latestRecovery = undefined;
+        }
+        notify(
+          ctx,
+          `清理结果：已删除 ${result.deleted} 个文件，${result.failed} 个失败并已保留。`,
+          result.failed > 0 || result.changed ? "warning" : "info",
+        );
+        return;
+      }
+      notify(ctx, "可用操作：/agentglass restore 或 /agentglass cleanup。");
+    },
+  });
+
   pi.on("session_start", (_event, ctx) => {
     clearRun();
+    latestRecovery = undefined;
     try {
       const current = ctx.sessionManager.getSessionId();
       sessionId = nonEmptyString(current) ? current : undefined;
@@ -726,6 +996,13 @@ export function registerPiAdapter(
       batch = mapToolCall(pi, event, ctx, sessionId, userGoal);
       const current = batch.find((item) => item.toolCallId === toolCallId);
       if (!current) throw new Error();
+      if (
+        latestRecovery &&
+        (latestRecovery.sessionId !== current.sessionId ||
+          latestRecovery.cwd !== current.cwd)
+      ) {
+        latestRecovery = undefined;
+      }
       // 在第一个 await 前同步占位；同一调用的并发重入只能看到已占用状态并失败关闭。
       activeExecutions.set(toolCallId, {
         hostExecutionId: current.hostExecutionId,
@@ -856,6 +1133,7 @@ export function registerPiAdapter(
           effect,
           observed.preImage,
           observed.capabilities,
+          latestRecovery !== undefined,
         );
         const token = issueApprovalToken(
           observed.action.actionId,
@@ -933,6 +1211,7 @@ export function registerPiAdapter(
             effect,
             targetPath: verificationTarget.targetPath,
             expected,
+            preImage: observed.preImage,
             inFlight: false,
           });
           setActionCard(ctx, renderOutcomeCardUpdate(observed.action, effect));
@@ -1003,9 +1282,48 @@ export function registerPiAdapter(
           outcome,
           "RESULT_IDENTITY_MISMATCH",
         );
+    let recoveryAvailable = false;
+    if (
+      report.status === "matched" &&
+      pending.expected.kind === "exact_bytes"
+    ) {
+      const ready = await finalizeRecoverySnapshot(
+        snapshotRoot,
+        pending.preImage,
+        pending.effect.effectId,
+        pending.expected.expectedSha256,
+        pending.expected.expectedByteLength,
+      );
+      if (ready && runGeneration === generation) {
+        const previous = latestRecovery;
+        const replacementRecorded =
+          !previous ||
+          (await markRecoveryState(snapshotRoot, previous, "superseded"));
+        if (replacementRecorded) {
+          latestRecovery = Object.freeze({
+            ...ready,
+            sessionId: pending.binding.sessionId,
+            cwd: pending.binding.cwd,
+            targetLabel: pending.effect.targetLabel,
+          });
+          recoveryAvailable = true;
+        }
+      }
+    }
+    if (
+      runGeneration !== generation ||
+      pendingVerifications.get(event.toolCallId) !== pending
+    ) {
+      return;
+    }
     setActionCard(
       ctx,
-      renderOutcomeCardUpdate(pending.action, pending.effect, report),
+      renderOutcomeCardUpdate(
+        pending.action,
+        pending.effect,
+        report,
+        recoveryAvailable,
+      ),
     );
     pendingVerifications.delete(event.toolCallId);
   });
@@ -1050,6 +1368,7 @@ export function registerPiAdapter(
   pi.on("agent_end", (_event, ctx) => clearRun(ctx));
   pi.on("session_shutdown", () => {
     clearRun();
+    latestRecovery = undefined;
     sessionId = undefined;
   });
 }

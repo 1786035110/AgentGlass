@@ -65,7 +65,9 @@ test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", asy
     expect(extension?.resolvedPath).toBe(
       join(root, "extensions/agentglass.ts"),
     );
-    expect(extension?.commands.size).toBe(0);
+    expect([...(extension?.commands ?? new Map()).keys()]).toEqual([
+      "agentglass",
+    ]);
     expect(extension?.tools.size).toBe(0);
     expect(extension).toBeDefined();
     expect([...(extension?.handlers.keys() ?? [])].sort()).toEqual([

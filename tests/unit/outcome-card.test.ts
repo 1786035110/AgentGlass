@@ -68,7 +68,7 @@ test.each([
     expect(text).toContain(toolFact);
     expect(text).toContain("仅独立读取这份明确文件");
     expect(text).toContain("程序功能是否正确");
-    expect(text).toContain("当前不能自动恢复");
+    expect(text).toContain("当前不提供恢复入口");
     expect(text).not.toMatch(/可以恢复|Undo|回滚/u);
   },
 );
@@ -82,6 +82,39 @@ test("A-011 ordinary read has one mergeable non-mutating notice", () => {
   expect(renderReadNotice(fixture.action, fixture.risk, fixture.effect)).toBe(
     "正在查看：活动说明.txt，不会修改它。",
   );
+});
+
+test("B-002 reveals replacement before approval and only offers a ready recovery", () => {
+  const fixture = outcomeCardFixtures.find(
+    (item) => item.name === "modify with saved pre-image",
+  );
+  if (!fixture) throw new Error("modify fixture missing");
+  const card = renderOutcomeCard(
+    fixture.action,
+    fixture.risk,
+    fixture.effect,
+    fixture.snapshot,
+    fixture.capabilities,
+    true,
+  );
+  expect(card.recovery).toContain("完成后会检查");
+  expect(card.attention).toContain("上一项将不再提供恢复入口");
+  const update = renderOutcomeCardUpdate(
+    fixture.action,
+    fixture.effect,
+    {
+      actionId: fixture.action.actionId,
+      effectId: fixture.effect.effectId,
+      targetId: fixture.effect.targetId,
+      status: "matched",
+      toolOutcome: "succeeded",
+      reasonCodes: ["POSTCONDITION_MATCHED"],
+      checkScope: "single_file",
+      applicationOutcome: "unverifiable",
+    },
+    true,
+  );
+  expect(update.lines.join("\n")).toContain("/agentglass");
 });
 
 test("A-011 read notice does not claim read-only when structured facts disagree", () => {

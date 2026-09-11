@@ -61,15 +61,14 @@ test("INV-005: huge untrusted labels are bounded while fixed safety facts remain
   expect(output).toContain("无法确认它是否能完成你的实际目标");
 });
 
-test("INV-004/009: saved snapshot never becomes a recovery claim", () => {
+test("INV-004/009: prepared evidence promises only a later recovery check", () => {
   for (const name of [
     "new file with saved absence evidence",
     "modify with saved pre-image",
   ]) {
     const output = visibleCopy(name);
-    expect(output).toContain("已保存修改前证据");
-    expect(output).toContain("有备份不等于当前可恢复");
-    expect(output).toContain("当前不能自动恢复");
+    expect(output).toContain("已保存修改前副本");
+    expect(output).toContain("完成后会检查是否能恢复");
     expect(output).not.toMatch(/可以恢复|可撤销|Undo|回滚/u);
   }
 
@@ -172,7 +171,7 @@ test("INV-010/013: batch block keeps sequential-retry and other danger explanati
   expect(incomplete).toContain("执行前的必要检查没有完成");
 });
 
-test("INV-005/009: B-001 result feedback redacts labels and never exposes result bodies or recovery claims", () => {
+test("INV-005/009: result feedback redacts labels and does not invent a recovery entry", () => {
   const fixture = outcomeCardFixtures.find(
     (item) => item.name === "synthetic secret in label",
   );
@@ -192,6 +191,6 @@ test("INV-005/009: B-001 result feedback redacts labels and never exposes result
   expect(output).not.toContain("synthetic-secret-value");
   expect(output).not.toContain("RESULT_MISSING");
   expect(output).toContain("无法确认工具是否完成");
-  expect(output).toContain("当前不能自动恢复");
+  expect(output).toContain("当前不提供恢复入口");
   expect(output).not.toMatch(/可以恢复|可撤销|Undo|回滚/u);
 });

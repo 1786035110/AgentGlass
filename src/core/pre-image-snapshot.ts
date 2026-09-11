@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
+  chown,
   lstat,
   mkdir,
   open,
@@ -38,11 +39,13 @@ export type SnapshotFailureInjection =
   | "disk_full"
   | "interrupted_publish";
 
-interface SnapshotManifestV1 {
-  schemaVersion: 1;
-  kind: "agentglass-pre-image";
+interface RecoveryManifestV2 {
+  schemaVersion: 2;
+  kind: "agentglass-single-file-recovery";
+  state: "prepared" | "ready" | "consumed" | "superseded";
   snapshotId: string;
   actionId: string;
+  effectId: string | null;
   targetId: string;
   targetPath: string;
   targetExisted: boolean;
@@ -51,19 +54,47 @@ interface SnapshotManifestV1 {
     byteLength: number;
     sha256: string;
   };
-  fileIdentity: null | {
+  preIdentity: null | {
     device: string;
     inode: string;
   };
-  permissions: null | {
-    platform: NodeJS.Platform;
-    mode: number;
-    uid: string;
-    gid: string;
-    acl: null | { format: "sddl"; value: string };
+  prePermissions: null | FilePermissions;
+  postImage: null | {
+    byteLength: number;
+    sha256: string;
+    identity: { device: string; inode: string };
+    permissions: FilePermissions;
   };
-  canRestoreNow: false;
-  recoveryGrade: "unknown";
+}
+
+interface FilePermissions {
+  platform: NodeJS.Platform;
+  mode: number;
+  uid: string;
+  gid: string;
+  acl: null | { format: "sddl"; value: string };
+}
+
+export interface RecoveryEntry {
+  snapshotId: string;
+  actionId: string;
+  effectId: string;
+  targetId: string;
+  targetPathHash: string;
+  targetExisted: boolean;
+}
+
+export interface RecoveryResult {
+  status: "restored" | "conflict" | "failed";
+  content: "matched" | "missing" | "unknown";
+  permissions: "matched" | "not_applicable" | "unknown";
+}
+
+export interface CleanupSet {
+  fingerprint: string;
+  files: readonly string[];
+  fileCount: number;
+  logicalBytes: number;
 }
 
 class SnapshotError extends Error {
@@ -114,6 +145,15 @@ $p = $env:AGENTGLASS_SNAPSHOT_ACL_PATH
 $item = if ([System.IO.File]::Exists($p)) { New-Object System.IO.FileInfo($p) } else { exit 1 }
 $sddl = $item.GetAccessControl().GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)
 [Console]::Out.Write($sddl)
+`;
+
+const WINDOWS_APPLY_ACL_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+$p = $env:AGENTGLASS_SNAPSHOT_ACL_PATH
+$sddl = $env:AGENTGLASS_TARGET_SDDL
+$acl = New-Object System.Security.AccessControl.FileSecurity
+$acl.SetSecurityDescriptorSddlForm($sddl)
+(New-Object System.IO.FileInfo($p)).SetAccessControl($acl)
 `;
 
 function evidence(
@@ -177,6 +217,32 @@ async function runPowerShell(script: string, target: string): Promise<string> {
     },
   );
   return stdout;
+}
+
+async function applyWindowsTargetAcl(
+  target: string,
+  sddl: string,
+): Promise<void> {
+  const encoded = Buffer.from(WINDOWS_APPLY_ACL_SCRIPT, "utf16le").toString(
+    "base64",
+  );
+  const windowsRoot = path.parse(process.env.SystemRoot ?? "C:\\Windows").root;
+  await execFileAsync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+    {
+      windowsHide: true,
+      timeout: 10_000,
+      maxBuffer: 64 * 1024,
+      env: {
+        ...process.env,
+        SystemDrive: windowsRoot.slice(0, 2),
+        ProgramData: path.join(windowsRoot, "ProgramData"),
+        AGENTGLASS_SNAPSHOT_ACL_PATH: target,
+        AGENTGLASS_TARGET_SDDL: sddl,
+      },
+    },
+  );
 }
 
 async function readWindowsTargetAcl(target: string): Promise<string> {
@@ -378,11 +444,13 @@ export async function capturePreImageSnapshot(
       captured && process.platform === "win32"
         ? await readWindowsTargetAcl(target.targetPath)
         : undefined;
-    const manifest: SnapshotManifestV1 = {
-      schemaVersion: 1,
-      kind: "agentglass-pre-image",
+    const manifest: RecoveryManifestV2 = {
+      schemaVersion: 2,
+      kind: "agentglass-single-file-recovery",
+      state: "prepared",
       snapshotId,
       actionId: target.actionId,
+      effectId: null,
       targetId: target.targetId,
       targetPath: target.targetPath,
       targetExisted: target.targetExisted,
@@ -393,13 +461,13 @@ export async function capturePreImageSnapshot(
             sha256: sha256 ?? "",
           }
         : null,
-      fileIdentity: captured
+      preIdentity: captured
         ? {
             device: String(captured.stats.dev),
             inode: String(captured.stats.ino),
           }
         : null,
-      permissions: captured
+      prePermissions: captured
         ? {
             platform: process.platform,
             mode: Number(captured.stats.mode) & 0o7777,
@@ -411,8 +479,7 @@ export async function capturePreImageSnapshot(
                 : null,
           }
         : null,
-      canRestoreNow: false,
-      recoveryGrade: "unknown",
+      postImage: null,
     };
     const manifestBytes = Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8");
     if (manifestBytes.length > MANIFEST_LIMIT_BYTES)
@@ -511,17 +578,18 @@ export async function verifyPreImageSnapshotBaseline(
     const parsed: unknown = JSON.parse(bytes.toString("utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
       return false;
-    const manifest = parsed as SnapshotManifestV1;
+    const manifest = parsed as RecoveryManifestV2;
     if (
-      manifest.schemaVersion !== 1 ||
-      manifest.kind !== "agentglass-pre-image" ||
+      manifest.schemaVersion !== 2 ||
+      manifest.kind !== "agentglass-single-file-recovery" ||
+      manifest.state !== "prepared" ||
       manifest.snapshotId !== snapshot.snapshotId ||
       manifest.actionId !== expectedTarget.actionId ||
+      manifest.effectId !== null ||
       manifest.targetId !== expectedTarget.targetId ||
       manifest.targetPath !== expectedTarget.targetPath ||
       manifest.targetExisted !== expectedTarget.targetExisted ||
-      manifest.canRestoreNow !== false ||
-      manifest.recoveryGrade !== "unknown" ||
+      manifest.postImage !== null ||
       typeof manifest.targetExisted !== "boolean" ||
       !path.isAbsolute(manifest.targetPath) ||
       snapshot.targetExisted !== (manifest.targetExisted ? "yes" : "no")
@@ -532,8 +600,8 @@ export async function verifyPreImageSnapshotBaseline(
     if (!manifest.targetExisted) {
       if (
         manifest.preImage !== null ||
-        manifest.fileIdentity !== null ||
-        manifest.permissions !== null
+        manifest.preIdentity !== null ||
+        manifest.prePermissions !== null
       ) {
         return false;
       }
@@ -542,23 +610,23 @@ export async function verifyPreImageSnapshotBaseline(
 
     if (
       !manifest.preImage ||
-      !manifest.fileIdentity ||
-      !manifest.permissions ||
+      !manifest.preIdentity ||
+      !manifest.prePermissions ||
       manifest.preImage.file !== `${snapshot.snapshotId}.preimage` ||
       !Number.isSafeInteger(manifest.preImage.byteLength) ||
       manifest.preImage.byteLength < 0 ||
       manifest.preImage.byteLength > SNAPSHOT_FILE_LIMIT_BYTES ||
       !/^[0-9a-f]{64}$/u.test(manifest.preImage.sha256) ||
-      typeof manifest.fileIdentity.device !== "string" ||
-      typeof manifest.fileIdentity.inode !== "string" ||
-      manifest.permissions.platform !== process.platform ||
-      !Number.isSafeInteger(manifest.permissions.mode) ||
-      typeof manifest.permissions.uid !== "string" ||
-      typeof manifest.permissions.gid !== "string" ||
-      (manifest.permissions.acl !== null &&
-        (manifest.permissions.acl.format !== "sddl" ||
-          typeof manifest.permissions.acl.value !== "string")) ||
-      (process.platform === "win32") !== (manifest.permissions.acl !== null)
+      typeof manifest.preIdentity.device !== "string" ||
+      typeof manifest.preIdentity.inode !== "string" ||
+      manifest.prePermissions.platform !== process.platform ||
+      !Number.isSafeInteger(manifest.prePermissions.mode) ||
+      typeof manifest.prePermissions.uid !== "string" ||
+      typeof manifest.prePermissions.gid !== "string" ||
+      (manifest.prePermissions.acl !== null &&
+        (manifest.prePermissions.acl.format !== "sddl" ||
+          typeof manifest.prePermissions.acl.value !== "string")) ||
+      (process.platform === "win32") !== (manifest.prePermissions.acl !== null)
     ) {
       return false;
     }
@@ -572,7 +640,7 @@ export async function verifyPreImageSnapshotBaseline(
       .digest("hex");
     const savedHash = createHash("sha256").update(saved.bytes).digest("hex");
     const currentAcl =
-      manifest.permissions.acl?.format === "sddl" &&
+      manifest.prePermissions.acl?.format === "sddl" &&
       process.platform === "win32"
         ? await readWindowsTargetAcl(manifest.targetPath)
         : null;
@@ -583,18 +651,596 @@ export async function verifyPreImageSnapshotBaseline(
       saved.stats.nlink === 1 &&
       captured.bytes.length === manifest.preImage.byteLength &&
       saved.bytes.length === manifest.preImage.byteLength &&
-      String(captured.stats.dev) === manifest.fileIdentity.device &&
-      String(captured.stats.ino) === manifest.fileIdentity.inode &&
-      (Number(captured.stats.mode) & 0o7777) === manifest.permissions.mode &&
-      String(captured.stats.uid) === manifest.permissions.uid &&
-      String(captured.stats.gid) === manifest.permissions.gid &&
+      String(captured.stats.dev) === manifest.preIdentity.device &&
+      String(captured.stats.ino) === manifest.preIdentity.inode &&
+      (Number(captured.stats.mode) & 0o7777) === manifest.prePermissions.mode &&
+      String(captured.stats.uid) === manifest.prePermissions.uid &&
+      String(captured.stats.gid) === manifest.prePermissions.gid &&
       currentHash === manifest.preImage.sha256 &&
       savedHash === manifest.preImage.sha256 &&
-      (manifest.permissions.acl === null ||
-        currentAcl === manifest.permissions.acl.value)
+      (manifest.prePermissions.acl === null ||
+        currentAcl === manifest.prePermissions.acl.value)
     );
   } catch {
     // 快照域缺失、损坏、未来版本或读取失败都不能维持旧卡片的前像事实。
     return false;
+  }
+}
+
+const SNAPSHOT_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function validPermissions(value: unknown): value is FilePermissions {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const permissions = value as Partial<FilePermissions>;
+  return Boolean(
+    permissions.platform === process.platform &&
+      Number.isSafeInteger(permissions.mode) &&
+      typeof permissions.uid === "string" &&
+      /^\d+$/u.test(permissions.uid) &&
+      typeof permissions.gid === "string" &&
+      /^\d+$/u.test(permissions.gid) &&
+      (permissions.acl === null ||
+        (permissions.acl?.format === "sddl" &&
+          typeof permissions.acl.value === "string")) &&
+      (process.platform === "win32") === (permissions.acl !== null),
+  );
+}
+
+async function readRecoveryManifest(
+  snapshotRoot: string,
+  snapshotId: string,
+): Promise<RecoveryManifestV2> {
+  if (!SNAPSHOT_ID.test(snapshotId)) fail("SNAPSHOT_STORAGE_UNSAFE");
+  const { bytes } = await readBounded(
+    path.join(snapshotRoot, `${snapshotId}.manifest.json`),
+    MANIFEST_LIMIT_BYTES,
+  );
+  const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    fail("SNAPSHOT_STORAGE_UNSAFE");
+  const manifest = parsed as RecoveryManifestV2;
+  if (
+    manifest.schemaVersion !== 2 ||
+    manifest.kind !== "agentglass-single-file-recovery" ||
+    !["prepared", "ready", "consumed", "superseded"].includes(manifest.state) ||
+    manifest.snapshotId !== snapshotId ||
+    !nonEmpty(manifest.actionId) ||
+    !(manifest.effectId === null || nonEmpty(manifest.effectId)) ||
+    !nonEmpty(manifest.targetId) ||
+    !path.isAbsolute(manifest.targetPath) ||
+    typeof manifest.targetExisted !== "boolean" ||
+    (manifest.targetExisted
+      ? !manifest.preImage ||
+        manifest.preImage.file !== `${snapshotId}.preimage` ||
+        !Number.isSafeInteger(manifest.preImage.byteLength) ||
+        manifest.preImage.byteLength < 0 ||
+        manifest.preImage.byteLength > SNAPSHOT_FILE_LIMIT_BYTES ||
+        !/^[0-9a-f]{64}$/u.test(manifest.preImage.sha256) ||
+        !manifest.preIdentity ||
+        !nonEmpty(manifest.preIdentity.device) ||
+        !nonEmpty(manifest.preIdentity.inode) ||
+        !validPermissions(manifest.prePermissions)
+      : manifest.preImage !== null ||
+        manifest.preIdentity !== null ||
+        manifest.prePermissions !== null)
+  ) {
+    fail("SNAPSHOT_STORAGE_UNSAFE");
+  }
+  return manifest;
+}
+
+function nonEmpty(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+async function observedPermissions(
+  targetPath: string,
+  observed: Awaited<ReturnType<typeof readStableFile>>,
+): Promise<FilePermissions> {
+  return {
+    platform: process.platform,
+    mode: observed.mode & 0o7777,
+    uid: observed.uid,
+    gid: observed.gid,
+    acl:
+      process.platform === "win32"
+        ? { format: "sddl", value: await readWindowsTargetAcl(targetPath) }
+        : null,
+  };
+}
+
+async function publishManifest(
+  snapshotRoot: string,
+  manifest: RecoveryManifestV2,
+  expectedState: RecoveryManifestV2["state"],
+): Promise<void> {
+  let lock: Awaited<ReturnType<typeof open>> | undefined;
+  const manifestPath = path.join(
+    snapshotRoot,
+    `${manifest.snapshotId}.manifest.json`,
+  );
+  const tempPath = path.join(
+    snapshotRoot,
+    `.${manifest.snapshotId}.manifest.json.tmp`,
+  );
+  try {
+    await secureStorageRoot(snapshotRoot);
+    lock = await open(path.join(snapshotRoot, LOCK_NAME), "wx", 0o600);
+    const current = await readRecoveryManifest(
+      snapshotRoot,
+      manifest.snapshotId,
+    );
+    if (
+      current.state !== expectedState ||
+      current.actionId !== manifest.actionId ||
+      current.targetId !== manifest.targetId ||
+      current.targetPath !== manifest.targetPath
+    )
+      fail("SNAPSHOT_TARGET_CHANGED");
+    const used = await storageUsage(snapshotRoot);
+    const oldBytes = (await lstat(manifestPath)).size;
+    const bytes = Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8");
+    if (
+      bytes.length > MANIFEST_LIMIT_BYTES ||
+      used.bytes + bytes.length > SNAPSHOT_TOTAL_LIMIT_BYTES ||
+      used.bytes - oldBytes + bytes.length > SNAPSHOT_TOTAL_LIMIT_BYTES
+    ) {
+      fail("SNAPSHOT_RESOURCE_LIMIT");
+    }
+    await writePrivateFile(tempPath, bytes);
+    if (!(await readFile(tempPath)).equals(bytes))
+      fail("SNAPSHOT_PUBLISH_FAILED");
+    await rename(tempPath, manifestPath);
+    await syncDirectory(snapshotRoot);
+  } finally {
+    await removePrivateFile(tempPath);
+    if (lock) {
+      await lock.close().catch(() => {});
+      await removePrivateFile(path.join(snapshotRoot, LOCK_NAME));
+    }
+  }
+}
+
+export async function finalizeRecoverySnapshot(
+  snapshotRoot: string | undefined,
+  snapshot: PreImageSnapshotEvidence,
+  effectId: string,
+  expectedSha256: string | null,
+  expectedByteLength: number | null,
+): Promise<RecoveryEntry | undefined> {
+  if (
+    !snapshotRoot ||
+    snapshot.status !== "saved" ||
+    !snapshot.snapshotId ||
+    !nonEmpty(effectId) ||
+    !expectedSha256 ||
+    expectedByteLength === null
+  ) {
+    return;
+  }
+  try {
+    const manifest = await readRecoveryManifest(
+      snapshotRoot,
+      snapshot.snapshotId,
+    );
+    if (manifest.state !== "prepared" || manifest.effectId !== null) return;
+    const observed = await readStableFile(
+      manifest.targetPath,
+      SNAPSHOT_FILE_LIMIT_BYTES,
+    );
+    if (
+      observed.bytes.length !== expectedByteLength ||
+      createHash("sha256").update(observed.bytes).digest("hex") !==
+        expectedSha256
+    ) {
+      return;
+    }
+    const ready: RecoveryManifestV2 = {
+      ...manifest,
+      state: "ready",
+      effectId,
+      postImage: {
+        byteLength: observed.bytes.length,
+        sha256: expectedSha256,
+        identity: observed.identity,
+        permissions: await observedPermissions(manifest.targetPath, observed),
+      },
+    };
+    await publishManifest(snapshotRoot, ready, "prepared");
+    return Object.freeze({
+      snapshotId: ready.snapshotId,
+      actionId: ready.actionId,
+      effectId,
+      targetId: ready.targetId,
+      targetPathHash: createHash("sha256")
+        .update(ready.targetPath, "utf8")
+        .digest("hex"),
+      targetExisted: ready.targetExisted,
+    });
+  } catch {
+    return;
+  }
+}
+
+async function readyManifest(
+  snapshotRoot: string,
+  entry: RecoveryEntry,
+): Promise<RecoveryManifestV2 | undefined> {
+  try {
+    const manifest = await readRecoveryManifest(snapshotRoot, entry.snapshotId);
+    if (
+      manifest.state !== "ready" ||
+      manifest.actionId !== entry.actionId ||
+      manifest.effectId !== entry.effectId ||
+      manifest.targetId !== entry.targetId ||
+      createHash("sha256").update(manifest.targetPath, "utf8").digest("hex") !==
+        entry.targetPathHash ||
+      manifest.targetExisted !== entry.targetExisted ||
+      !manifest.postImage ||
+      !Number.isSafeInteger(manifest.postImage.byteLength) ||
+      manifest.postImage.byteLength < 0 ||
+      manifest.postImage.byteLength > SNAPSHOT_FILE_LIMIT_BYTES ||
+      !/^[0-9a-f]{64}$/u.test(manifest.postImage.sha256) ||
+      !nonEmpty(manifest.postImage.identity?.device) ||
+      !nonEmpty(manifest.postImage.identity?.inode) ||
+      !validPermissions(manifest.postImage.permissions)
+    ) {
+      return;
+    }
+    return manifest;
+  } catch {
+    return;
+  }
+}
+
+async function matchesPostImage(
+  manifest: RecoveryManifestV2,
+): Promise<boolean> {
+  if (!manifest.postImage) return false;
+  try {
+    const current = await readStableFile(
+      manifest.targetPath,
+      SNAPSHOT_FILE_LIMIT_BYTES,
+    );
+    const permissions = await observedPermissions(manifest.targetPath, current);
+    return (
+      current.bytes.length === manifest.postImage.byteLength &&
+      createHash("sha256").update(current.bytes).digest("hex") ===
+        manifest.postImage.sha256 &&
+      current.identity.device === manifest.postImage.identity.device &&
+      current.identity.inode === manifest.postImage.identity.inode &&
+      JSON.stringify(permissions) ===
+        JSON.stringify(manifest.postImage.permissions)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function recoveryEntryIsCurrent(
+  snapshotRoot: string | undefined,
+  entry: RecoveryEntry,
+): Promise<boolean> {
+  if (!snapshotRoot) return false;
+  const manifest = await readyManifest(snapshotRoot, entry);
+  return Boolean(manifest && (await matchesPostImage(manifest)));
+}
+
+export async function markRecoveryState(
+  snapshotRoot: string | undefined,
+  entry: RecoveryEntry,
+  state: "consumed" | "superseded",
+): Promise<boolean> {
+  if (!snapshotRoot) return false;
+  const manifest = await readyManifest(snapshotRoot, entry);
+  if (!manifest) return false;
+  try {
+    await publishManifest(snapshotRoot, { ...manifest, state }, "ready");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function verifyRestored(
+  manifest: RecoveryManifestV2,
+): Promise<RecoveryResult> {
+  if (!manifest.targetExisted) {
+    try {
+      await lstat(manifest.targetPath);
+      return {
+        status: "failed",
+        content: "unknown",
+        permissions: "not_applicable",
+      };
+    } catch (error) {
+      return error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "ENOENT"
+        ? {
+            status: "restored",
+            content: "missing",
+            permissions: "not_applicable",
+          }
+        : {
+            status: "failed",
+            content: "unknown",
+            permissions: "not_applicable",
+          };
+    }
+  }
+  if (!manifest.preImage || !manifest.prePermissions)
+    return { status: "failed", content: "unknown", permissions: "unknown" };
+  try {
+    const observed = await readStableFile(
+      manifest.targetPath,
+      SNAPSHOT_FILE_LIMIT_BYTES,
+    );
+    const content =
+      observed.bytes.length === manifest.preImage.byteLength &&
+      createHash("sha256").update(observed.bytes).digest("hex") ===
+        manifest.preImage.sha256
+        ? "matched"
+        : "unknown";
+    const permissions =
+      JSON.stringify(
+        await observedPermissions(manifest.targetPath, observed),
+      ) === JSON.stringify(manifest.prePermissions)
+        ? "matched"
+        : "unknown";
+    return {
+      status:
+        content === "matched" && permissions === "matched"
+          ? "restored"
+          : "failed",
+      content,
+      permissions,
+    };
+  } catch {
+    return { status: "failed", content: "unknown", permissions: "unknown" };
+  }
+}
+
+export async function restoreRecoveryEntry(
+  snapshotRoot: string | undefined,
+  entry: RecoveryEntry,
+): Promise<RecoveryResult> {
+  if (!snapshotRoot)
+    return { status: "failed", content: "unknown", permissions: "unknown" };
+  const manifest = await readyManifest(snapshotRoot, entry);
+  if (!manifest)
+    return { status: "conflict", content: "unknown", permissions: "unknown" };
+  if (!(await matchesPostImage(manifest))) {
+    await markRecoveryState(snapshotRoot, entry, "consumed");
+    return { status: "conflict", content: "unknown", permissions: "unknown" };
+  }
+  if (!(await markRecoveryState(snapshotRoot, entry, "consumed")))
+    return { status: "failed", content: "unknown", permissions: "unknown" };
+  try {
+    if (!manifest.targetExisted) {
+      await unlink(manifest.targetPath);
+    } else {
+      if (!manifest.preImage || !manifest.prePermissions) throw new Error();
+      const saved = await readBounded(
+        path.join(snapshotRoot, manifest.preImage.file),
+      );
+      if (
+        saved.bytes.length !== manifest.preImage.byteLength ||
+        createHash("sha256").update(saved.bytes).digest("hex") !==
+          manifest.preImage.sha256
+      ) {
+        throw new Error();
+      }
+      const temp = path.join(
+        path.dirname(manifest.targetPath),
+        `.agentglass-restore-${randomUUID()}.tmp`,
+      );
+      try {
+        const handle = await open(temp, "wx", manifest.prePermissions.mode);
+        try {
+          await handle.writeFile(saved.bytes);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        await chmod(temp, manifest.prePermissions.mode);
+        if (process.platform !== "win32") {
+          await chown(
+            temp,
+            Number(manifest.prePermissions.uid),
+            Number(manifest.prePermissions.gid),
+          );
+        }
+        await rename(temp, manifest.targetPath);
+        if (
+          process.platform === "win32" &&
+          manifest.prePermissions.acl?.format === "sddl"
+        ) {
+          await applyWindowsTargetAcl(
+            manifest.targetPath,
+            manifest.prePermissions.acl.value,
+          );
+        }
+        await syncDirectory(path.dirname(manifest.targetPath));
+      } finally {
+        await removePrivateFile(temp);
+      }
+    }
+  } catch {
+    return await verifyRestored(manifest);
+  }
+  return await verifyRestored(manifest);
+}
+
+export async function inspectCleanupSet(
+  snapshotRoot: string | undefined,
+): Promise<CleanupSet> {
+  if (!snapshotRoot)
+    return { fingerprint: "", files: [], fileCount: 0, logicalBytes: 0 };
+  try {
+    await secureStorageRoot(snapshotRoot);
+    const entries = await readdir(snapshotRoot, { withFileTypes: true });
+    const files = new Set<string>();
+    for (const entry of entries) {
+      const match = /^([0-9a-f-]{36})\.manifest\.json$/u.exec(entry.name);
+      if (!entry.isFile() || !match?.[1] || !SNAPSHOT_ID.test(match[1]))
+        continue;
+      try {
+        const { bytes } = await readBounded(
+          path.join(snapshotRoot, entry.name),
+          MANIFEST_LIMIT_BYTES,
+        );
+        const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+          continue;
+        const candidate = parsed as Record<string, unknown>;
+        if (
+          candidate.schemaVersion === 1 &&
+          candidate.kind === "agentglass-pre-image" &&
+          candidate.snapshotId === match[1] &&
+          candidate.canRestoreNow === false &&
+          candidate.recoveryGrade === "unknown" &&
+          typeof candidate.actionId === "string" &&
+          typeof candidate.targetId === "string" &&
+          typeof candidate.targetPath === "string" &&
+          path.isAbsolute(candidate.targetPath) &&
+          typeof candidate.targetExisted === "boolean"
+        ) {
+          const preImage = candidate.preImage as {
+            file?: unknown;
+            byteLength?: unknown;
+            sha256?: unknown;
+          } | null;
+          if (
+            candidate.targetExisted &&
+            (!preImage ||
+              preImage.file !== `${match[1]}.preimage` ||
+              !Number.isSafeInteger(preImage.byteLength) ||
+              typeof preImage.sha256 !== "string" ||
+              !candidate.fileIdentity ||
+              typeof candidate.fileIdentity !== "object" ||
+              !candidate.permissions ||
+              typeof candidate.permissions !== "object")
+          ) {
+            continue;
+          }
+          if (
+            !candidate.targetExisted &&
+            (preImage !== null ||
+              candidate.fileIdentity !== null ||
+              candidate.permissions !== null)
+          )
+            continue;
+          if (preImage?.file === `${match[1]}.preimage`) {
+            const body = await readBounded(
+              path.join(snapshotRoot, preImage.file),
+            );
+            if (
+              body.bytes.length !== preImage.byteLength ||
+              createHash("sha256").update(body.bytes).digest("hex") !==
+                preImage.sha256
+            )
+              continue;
+          }
+          files.add(entry.name);
+          if (preImage?.file === `${match[1]}.preimage`)
+            files.add(preImage.file);
+          continue;
+        }
+        const manifest = await readRecoveryManifest(snapshotRoot, match[1]);
+        if (manifest.preImage) {
+          const body = await readBounded(
+            path.join(snapshotRoot, manifest.preImage.file),
+          );
+          if (
+            body.bytes.length !== manifest.preImage.byteLength ||
+            createHash("sha256").update(body.bytes).digest("hex") !==
+              manifest.preImage.sha256
+          )
+            continue;
+        }
+        files.add(entry.name);
+        if (manifest.preImage) files.add(manifest.preImage.file);
+      } catch {
+        // 损坏、未来版本或归属无法验证的数据保留，不靠文件名猜测删除。
+      }
+    }
+    const sorted = [...files].sort();
+    let logicalBytes = 0;
+    const fingerprintRows: Array<[string, number, string]> = [];
+    for (const file of sorted) {
+      const observed = await readBounded(
+        path.join(snapshotRoot, file),
+        file.endsWith(".manifest.json")
+          ? MANIFEST_LIMIT_BYTES
+          : SNAPSHOT_FILE_LIMIT_BYTES,
+      );
+      logicalBytes += observed.bytes.length;
+      fingerprintRows.push([
+        file,
+        observed.bytes.length,
+        createHash("sha256").update(observed.bytes).digest("hex"),
+      ]);
+    }
+    return Object.freeze({
+      fingerprint: createHash("sha256")
+        .update(JSON.stringify(fingerprintRows))
+        .digest("hex"),
+      files: Object.freeze(sorted),
+      fileCount: sorted.length,
+      logicalBytes,
+    });
+  } catch {
+    return { fingerprint: "", files: [], fileCount: 0, logicalBytes: 0 };
+  }
+}
+
+export async function cleanSnapshotSet(
+  snapshotRoot: string | undefined,
+  approved: CleanupSet,
+  deleteFile: (filePath: string) => Promise<void> = unlink,
+): Promise<{
+  deleted: number;
+  failed: number;
+  changed: boolean;
+  deletedFiles: readonly string[];
+}> {
+  if (!snapshotRoot || !approved.fingerprint)
+    return { deleted: 0, failed: 0, changed: true, deletedFiles: [] };
+  let lock: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    await secureStorageRoot(snapshotRoot);
+    lock = await open(path.join(snapshotRoot, LOCK_NAME), "wx", 0o600);
+    const current = await inspectCleanupSet(snapshotRoot);
+    if (current.fingerprint !== approved.fingerprint)
+      return { deleted: 0, failed: 0, changed: true, deletedFiles: [] };
+    let deleted = 0;
+    let failed = 0;
+    const deletedFiles: string[] = [];
+    // 逐项删除使局部磁盘/权限失败可被如实统计；不回滚已删项，也不扩大到未批准集合。
+    for (const file of approved.files) {
+      try {
+        await deleteFile(path.join(snapshotRoot, file));
+        deleted += 1;
+        deletedFiles.push(file);
+      } catch {
+        failed += 1;
+      }
+    }
+    return { deleted, failed, changed: false, deletedFiles };
+  } catch {
+    return {
+      deleted: 0,
+      failed: approved.fileCount,
+      changed: false,
+      deletedFiles: [],
+    };
+  } finally {
+    if (lock) {
+      await lock.close().catch(() => {});
+      await removePrivateFile(path.join(snapshotRoot, LOCK_NAME));
+    }
   }
 }

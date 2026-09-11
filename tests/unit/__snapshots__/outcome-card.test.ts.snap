@@ -21,7 +21,7 @@ exports[`A-011 local zh-CN templates match every specified fixture 1`] = `
       "修改前证据：已保存；执行前目标文件存在；已记录原权限。",
     ],
     "expectedOutcome": "预计结果：活动说明.txt 中选定的内容会被替换。",
-    "recovery": "恢复：已保存修改前证据，但有备份不等于当前可恢复；当前不能自动恢复这次修改。",
+    "recovery": "恢复：已保存修改前副本；完成后会检查是否能恢复这一次修改。",
     "title": "已停止：这一步没有获得执行许可",
   },
   "control-obscured synthetic secret": {
@@ -65,7 +65,7 @@ exports[`A-011 local zh-CN templates match every specified fixture 1`] = `
       "修改前证据：已保存；执行前目标文件存在；已记录原权限。",
     ],
     "expectedOutcome": "预计结果：活动说明.txt 中选定的内容会被替换。",
-    "recovery": "恢复：已保存修改前证据，但有备份不等于当前可恢复；当前不能自动恢复这次修改。",
+    "recovery": "恢复：已保存修改前副本；完成后会检查是否能恢复这一次修改。",
     "title": "下一步：修改 活动说明.txt",
   },
   "multiple simultaneous mutations": {
@@ -87,7 +87,7 @@ exports[`A-011 local zh-CN templates match every specified fixture 1`] = `
       "修改前证据：已保存；执行前目标文件不存在；原权限记录不适用。",
     ],
     "expectedOutcome": "预计结果：会尝试在当前项目中创建 活动说明.txt。",
-    "recovery": "恢复：已保存修改前证据，但有备份不等于当前可恢复；当前不能自动恢复这次修改。",
+    "recovery": "恢复：已保存修改前副本；完成后会检查是否能恢复这一次修改。",
     "title": "下一步：创建 活动说明.txt",
   },
   "ordinary read": {
@@ -131,7 +131,7 @@ exports[`A-011 local zh-CN templates match every specified fixture 1`] = `
       "修改前证据：已保存；执行前目标文件不存在；原权限记录不适用。",
     ],
     "expectedOutcome": "预计结果：会尝试在当前项目中创建 活动说明.txt。",
-    "recovery": "恢复：已保存修改前证据，但有备份不等于当前可恢复；当前不能自动恢复这次修改。",
+    "recovery": "恢复：已保存修改前副本；完成后会检查是否能恢复这一次修改。",
     "title": "下一步：创建 活动说明.txt",
   },
   "sensitive target": {

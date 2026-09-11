@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -159,6 +159,8 @@ function installApprovalUi(
   const rendered: string[][] = [];
   const statuses: Array<{ key: string; text: string | undefined }> = [];
   const widgets: Array<{ key: string; content: string[] | undefined }> = [];
+  const notifications: Array<{ message: string; type: string | undefined }> =
+    [];
   let customCalls = 0;
   let doneCalls = 0;
   const custom = (async <T>(factory: TestCustomFactory<T>) => {
@@ -211,6 +213,7 @@ function installApprovalUi(
           key,
           content: Array.isArray(content) ? [...content] : undefined,
         }),
+      notify: (message, type) => notifications.push({ message, type }),
     },
     mode,
   );
@@ -218,6 +221,7 @@ function installApprovalUi(
     rendered,
     statuses,
     widgets,
+    notifications,
     get customCalls() {
       return customCalls;
     },
@@ -323,6 +327,150 @@ test("Pi 0.85.1 maps the current goal, current siblings, and real execution iden
     "old-call",
   );
   expect(facts?.siblings[0]?.hostExecutionId).toBe(facts?.hostExecutionId);
+});
+
+test("B-002 keeps one recovery across agent_end, restores through /agentglass, and consumes it once", async () => {
+  const runtime = await createRuntime();
+  const ui = installApprovalUi(runtime, [
+    { inputs: ["down", "down", "enter"] },
+    { inputs: ["enter"] },
+    { inputs: ["down", "down", "enter"] },
+  ]);
+  const targetPath = join(runtime.cwd, "recover.txt");
+  await writeFile(targetPath, "before", "utf8");
+  const call = {
+    id: "recover-original",
+    name: "write",
+    arguments: { path: "recover.txt", content: "after" },
+  };
+  expect(await emitCall(runtime, call)).toBeUndefined();
+  await writeFile(targetPath, "after", "utf8");
+  await runtime.session.extensionRunner.emitToolResult({
+    type: "tool_result",
+    toolCallId: call.id,
+    toolName: "write",
+    input: call.arguments,
+    content: [{ type: "text", text: "ignored" }],
+    details: undefined,
+    isError: false,
+  });
+  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("/agentglass");
+  await runtime.session.extensionRunner.emit({
+    type: "tool_execution_end",
+    toolCallId: call.id,
+    toolName: "write",
+    result: {},
+    isError: false,
+  });
+  await runtime.session.extensionRunner.emit({
+    type: "agent_end",
+    messages: [],
+  });
+
+  expect(
+    await emitCall(runtime, {
+      id: "replacement-refused",
+      name: "write",
+      arguments: { path: "other.txt", content: "not approved" },
+    }),
+  ).toMatchObject({ block: true });
+  expect(ui.rendered.flat().join("").replaceAll(" ", "")).toContain(
+    "上一项将不再提供恢复入口",
+  );
+
+  await runtime.session.prompt("/agentglass restore");
+  expect(await readFile(targetPath, "utf8")).toBe("before");
+  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("已恢复");
+  expect(ui.customCalls).toBe(3);
+
+  await runtime.session.prompt("/agentglass restore");
+  expect(ui.customCalls).toBe(3);
+  expect(ui.notifications.at(-1)?.message).toContain("没有可用");
+});
+
+test("B-002 blocks recovery drift and cleanup requires a separate exact approval", async () => {
+  const runtime = await createRuntime();
+  const ui = installApprovalUi(runtime, [
+    { inputs: ["down", "down", "enter"] },
+    { inputs: ["enter"] },
+    { inputs: ["down", "down", "enter"] },
+  ]);
+  const targetPath = join(runtime.cwd, "cleanup.txt");
+  const call = {
+    id: "cleanup-original",
+    name: "write",
+    arguments: { path: "cleanup.txt", content: "after" },
+  };
+  expect(await emitCall(runtime, call)).toBeUndefined();
+  await writeFile(targetPath, "after", "utf8");
+  await runtime.session.extensionRunner.emitToolResult({
+    type: "tool_result",
+    toolCallId: call.id,
+    toolName: "write",
+    input: call.arguments,
+    content: [{ type: "text", text: "ignored" }],
+    details: undefined,
+    isError: false,
+  });
+  await writeFile(targetPath, "later edit", "utf8");
+  await runtime.session.prompt("/agentglass restore");
+  expect(await readFile(targetPath, "utf8")).toBe("later edit");
+  expect(ui.customCalls).toBe(1);
+  expect(ui.notifications.at(-1)?.message).toContain("保留当前内容");
+  await writeFile(targetPath, "after", "utf8");
+  await runtime.session.prompt("/agentglass restore");
+  expect(ui.customCalls).toBe(1);
+  expect(ui.notifications.at(-1)?.message).toContain("没有可用");
+
+  runtime.sessionManager.newSession({ id: "cleanup-session-two" });
+  await runtime.session.extensionRunner.emit({
+    type: "session_start",
+    reason: "new",
+  });
+  await runtime.session.prompt("/agentglass restore");
+  expect(ui.customCalls).toBe(1);
+  expect(ui.notifications.at(-1)?.message).toContain("没有可用");
+
+  const snapshotDirectory = join(runtime.cwd, ".agentglass", "snapshots");
+  const beforeCleanup = await readdir(snapshotDirectory);
+  await runtime.session.prompt("/agentglass cleanup");
+  expect(await readdir(snapshotDirectory)).toEqual(beforeCleanup);
+  expect(ui.notifications.at(-1)?.message).toContain("未批准清理");
+  await runtime.session.prompt("/agentglass cleanup");
+  expect(await readdir(snapshotDirectory)).toEqual([]);
+  expect(ui.notifications.at(-1)?.message).toContain("已删除");
+});
+
+test("B-002 invalidates restoration when the target drifts inside the approval dialog", async () => {
+  const runtime = await createRuntime();
+  const targetPath = join(runtime.cwd, "approval-drift.txt");
+  const ui = installApprovalUi(runtime, [
+    { inputs: ["down", "down", "enter"] },
+    {
+      onOpen: () => writeFile(targetPath, "later edit", "utf8"),
+      inputs: ["down", "down", "enter"],
+    },
+  ]);
+  await writeFile(targetPath, "before", "utf8");
+  const call = {
+    id: "approval-drift-original",
+    name: "write",
+    arguments: { path: "approval-drift.txt", content: "after" },
+  };
+  expect(await emitCall(runtime, call)).toBeUndefined();
+  await writeFile(targetPath, "after", "utf8");
+  await runtime.session.extensionRunner.emitToolResult({
+    type: "tool_result",
+    toolCallId: call.id,
+    toolName: "write",
+    input: call.arguments,
+    content: [],
+    details: undefined,
+    isError: false,
+  });
+  await runtime.session.prompt("/agentglass restore");
+  expect(await readFile(targetPath, "utf8")).toBe("later edit");
+  expect(ui.notifications.at(-1)?.message).toContain("批准期间");
 });
 
 test("Pi 0.85.1 sibling guard blocks only mutation/unknown members when a batch has at least two", async () => {

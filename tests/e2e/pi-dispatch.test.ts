@@ -450,7 +450,7 @@ describe.sequential("A-016 Pi 0.85.1 real dispatch E2E", () => {
     ).toHaveLength(3);
     expect(
       verificationCards.flatMap(({ content }) => content ?? []).join("\n"),
-    ).toContain("当前不能自动恢复");
+    ).toContain("/agentglass");
     expect(await readFile(join(runtime.cwd, "活动说明-副本.txt"), "utf8")).toBe(
       "新活动",
     );
@@ -472,6 +472,40 @@ describe.sequential("A-016 Pi 0.85.1 real dispatch E2E", () => {
       await readdir(join(runtime.agentDir, ".agentglass", "snapshots")),
     ).not.toHaveLength(0);
     expect(await exists(join(runtime.cwd, ".agentglass"))).toBe(false);
+  });
+
+  test("B-002 real Pi dispatch connects one file change to restore and cleanup", async () => {
+    const runtime = await createRuntime();
+    const targetPath = join(runtime.cwd, "可恢复.txt");
+    await writeFile(targetPath, "修改前", "utf8");
+    const ui = installApprovalUi(runtime, [
+      { inputs: ["down", "down", "enter"] },
+      { inputs: ["down", "down", "enter"] },
+      { inputs: ["down", "down", "enter"] },
+    ]);
+    await promptCalls(runtime, [
+      {
+        type: "toolCall",
+        id: "recoverable-change",
+        name: "edit",
+        arguments: {
+          path: "可恢复.txt",
+          edits: [{ oldText: "修改前", newText: "修改后" }],
+        },
+      },
+    ]);
+    expect(await readFile(targetPath, "utf8")).toBe("修改后");
+    expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("/agentglass");
+
+    await runtime.session.prompt("/agentglass restore");
+    expect(await readFile(targetPath, "utf8")).toBe("修改前");
+    expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("已恢复");
+
+    await runtime.session.prompt("/agentglass cleanup");
+    expect(
+      await readdir(join(runtime.agentDir, ".agentglass", "snapshots")),
+    ).toEqual([]);
+    expect(ui.customCalls).toBe(3);
   });
 
   test("Stop stays focused; details do not approve; Continue, Stop, Esc, and cancel remain distinct", async () => {

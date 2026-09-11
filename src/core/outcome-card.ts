@@ -38,6 +38,8 @@ const riskExplanations: Readonly<Record<RiskReasonCode, string>> = {
     "无法确认同时提出的操作是否完整，必须改为一次只提出一个变更。",
   BACKUP_UNAVAILABLE:
     "未能取得这次修改所需的修改前证据，或这一步还会隐式创建上级文件夹；当前版本已停止这一步。请明确选择已有文件夹中的一份普通文件后重试。",
+  RESTORE_CONFLICT:
+    "当前文件与这次修改完成后的记录不一致，已停止恢复并保留当前内容。",
   UNSUPPORTED_TOOL:
     "当前版本不支持这类操作。你可以返回对话，选择一个普通项目文件任务。",
   SENSITIVE_TARGET:
@@ -122,7 +124,7 @@ function recoveryText(
   blocked: boolean,
 ): string {
   if (snapshot.status === "saved") {
-    return "恢复：已保存修改前证据，但有备份不等于当前可恢复；当前不能自动恢复这次修改。";
+    return "恢复：已保存修改前副本；完成后会检查是否能恢复这一次修改。";
   }
   if (snapshot.status === "unavailable") {
     return "恢复：未能保存修改前证据；当前不能自动恢复这次修改。";
@@ -171,6 +173,7 @@ export function renderOutcomeCard(
   effect: PredictedEffect,
   snapshot: PreImageSnapshotEvidence,
   capabilities?: HostCapabilities,
+  replacesPreviousRecovery = false,
 ): OutcomeCard {
   const target = action.targets[0];
   // 展示层重新验证确定性基线，只用于防止错误调用者用较弱 RiskAssessment 生成误导文案；
@@ -244,6 +247,11 @@ export function renderOutcomeCard(
       attention,
       "AgentGlass 只能说明计划中的文件动作，无法确认它是否能完成你的实际目标。",
     );
+  if (replacesPreviousRecovery)
+    addUnique(
+      attention,
+      "继续并成功记录这次修改后，上一项将不再提供恢复入口。",
+    );
 
   const details = [
     locationDetail(action, label),
@@ -293,6 +301,7 @@ export function renderOutcomeCardUpdate(
   action: ActionFacts,
   effect: PredictedEffect,
   report?: VerificationReport,
+  recoveryAvailable = false,
 ): OutcomeCardUpdate {
   const target = action.targets[0];
   const consistent = Boolean(
@@ -313,7 +322,7 @@ export function renderOutcomeCardUpdate(
         "已确认：这次只会核对卡片中列出的这一份文件。",
         "还不能确认：实际文件结果、实际目标是否达成及程序功能。",
         "检查范围：仅这份明确文件，不扫描项目。",
-        "恢复：当前不能自动恢复这次修改。",
+        "恢复：修改完成后会检查本次恢复依据。",
       ]),
     });
   }
@@ -356,7 +365,9 @@ export function renderOutcomeCardUpdate(
       `${state === "unknown" ? "未确认" : "已知"}：${fileFact}`,
       "仍未知：这份文件是否满足你的实际需求，以及程序功能是否正确。",
       "检查范围：仅独立读取这份明确文件，不扫描项目。",
-      "恢复：当前不能自动恢复这次修改。",
+      recoveryAvailable
+        ? "恢复：可在 /agentglass 中恢复这一次修改。"
+        : "恢复：没有形成完整恢复依据，当前不提供恢复入口。",
       state === "matched"
         ? "下一步：你可以返回 Pi 继续后续文件任务。"
         : "下一步：请返回 Pi 检查这份文件，再明确提出下一步。",
