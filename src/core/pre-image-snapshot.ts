@@ -25,6 +25,7 @@ export const SNAPSHOT_TOTAL_LIMIT_BYTES = 100 * 1024 * 1024;
 export const SNAPSHOT_ENTRY_LIMIT = 4096;
 const MANIFEST_LIMIT_BYTES = 64 * 1024;
 const LOCK_NAME = ".snapshot.lock";
+const WINDOWS_ACL_APPLY_ATTEMPTS = 3;
 const execFileAsync = promisify(execFile);
 
 export interface SensitiveSnapshotTarget {
@@ -223,33 +224,59 @@ async function applyWindowsTargetAcl(
   target: string,
   sddl: string,
 ): Promise<void> {
-  const encoded = Buffer.from(WINDOWS_APPLY_ACL_SCRIPT, "utf16le").toString(
-    "base64",
-  );
-  const windowsRoot = path.parse(process.env.SystemRoot ?? "C:\\Windows").root;
-  await execFileAsync(
-    "powershell.exe",
-    ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-    {
-      windowsHide: true,
-      timeout: 10_000,
-      maxBuffer: 64 * 1024,
-      env: {
-        ...process.env,
-        SystemDrive: windowsRoot.slice(0, 2),
-        ProgramData: path.join(windowsRoot, "ProgramData"),
-        AGENTGLASS_SNAPSHOT_ACL_PATH: target,
-        AGENTGLASS_TARGET_SDDL: sddl,
-      },
-    },
-  );
+  let lastError: unknown;
+  for (let attempt = 0; attempt < WINDOWS_ACL_APPLY_ATTEMPTS; attempt += 1) {
+    try {
+      const encoded = Buffer.from(WINDOWS_APPLY_ACL_SCRIPT, "utf16le").toString(
+        "base64",
+      );
+      const windowsRoot = path.parse(
+        process.env.SystemRoot ?? "C:\\Windows",
+      ).root;
+      await execFileAsync(
+        "powershell.exe",
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-EncodedCommand",
+          encoded,
+        ],
+        {
+          windowsHide: true,
+          timeout: 10_000,
+          maxBuffer: 64 * 1024,
+          env: {
+            ...process.env,
+            SystemDrive: windowsRoot.slice(0, 2),
+            ProgramData: path.join(windowsRoot, "ProgramData"),
+            AGENTGLASS_SNAPSHOT_ACL_PATH: target,
+            AGENTGLASS_TARGET_SDDL: sddl,
+          },
+        },
+      );
+      // Windows 上的 ACL 写回可能在系统调用返回后短暂不可见；只有复读到完全相同的 SDDL 才算成功。
+      if ((await readWindowsTargetAcl(target)) === sddl.trim()) return;
+      lastError = new Error("SNAPSHOT_PERMISSION_DENIED");
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("SNAPSHOT_PERMISSION_DENIED");
 }
 
 async function readWindowsTargetAcl(target: string): Promise<string> {
   const acl = await runPowerShell(WINDOWS_READ_ACL_SCRIPT, target);
-  if (acl.length === 0 || Buffer.byteLength(acl, "utf8") > 32 * 1024)
+  const normalized = acl.trim();
+  if (
+    normalized.length === 0 ||
+    Buffer.byteLength(normalized, "utf8") > 32 * 1024
+  )
     fail("SNAPSHOT_PERMISSION_DENIED");
-  return acl;
+  return normalized;
 }
 
 async function secureStorageRoot(snapshotRoot: string): Promise<void> {
