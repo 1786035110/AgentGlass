@@ -144,7 +144,7 @@ const WINDOWS_READ_ACL_SCRIPT = `
 $ErrorActionPreference = 'Stop'
 $p = $env:AGENTGLASS_SNAPSHOT_ACL_PATH
 $item = if ([System.IO.File]::Exists($p)) { New-Object System.IO.FileInfo($p) } else { exit 1 }
-$sddl = $item.GetAccessControl().GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)
+$sddl = $item.GetAccessControl().GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
 [Console]::Out.Write($sddl)
 `;
 
@@ -152,9 +152,51 @@ const WINDOWS_APPLY_ACL_SCRIPT = `
 $ErrorActionPreference = 'Stop'
 $p = $env:AGENTGLASS_SNAPSHOT_ACL_PATH
 $sddl = $env:AGENTGLASS_TARGET_SDDL
+$access = [System.Security.AccessControl.AccessControlSections]::Access
 $acl = New-Object System.Security.AccessControl.FileSecurity
-$acl.SetSecurityDescriptorSddlForm($sddl)
+$acl.SetSecurityDescriptorSddlForm($sddl, $access)
 (New-Object System.IO.FileInfo($p)).SetAccessControl($acl)
+$expectedRules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+$actualRules = @((New-Object System.IO.FileInfo($p)).GetAccessControl().GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+function RuleKey($rule) {
+  $parts = @(
+    $rule.IdentityReference.Value,
+    $rule.AccessControlType.ToString(),
+    ([int]$rule.FileSystemRights).ToString(),
+    $rule.InheritanceFlags.ToString(),
+    $rule.PropagationFlags.ToString()
+  )
+  return ($parts -join "|")
+}
+$expectedKeys = @($expectedRules | ForEach-Object { RuleKey $_ } | Sort-Object) -join ";"
+$actualKeys = @($actualRules | ForEach-Object { RuleKey $_ } | Sort-Object) -join ";"
+if ($expectedKeys -ne $actualKeys) { exit 1 }
+exit 0
+`;
+
+const WINDOWS_COMPARE_ACL_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+$p = $env:AGENTGLASS_SNAPSHOT_ACL_PATH
+$sddl = $env:AGENTGLASS_TARGET_SDDL
+$access = [System.Security.AccessControl.AccessControlSections]::Access
+$expected = New-Object System.Security.AccessControl.FileSecurity
+$expected.SetSecurityDescriptorSddlForm($sddl, $access)
+$expectedRules = @($expected.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+$actualRules = @((New-Object System.IO.FileInfo($p)).GetAccessControl().GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+function RuleKey($rule) {
+  $parts = @(
+    $rule.IdentityReference.Value,
+    $rule.AccessControlType.ToString(),
+    ([int]$rule.FileSystemRights).ToString(),
+    $rule.InheritanceFlags.ToString(),
+    $rule.PropagationFlags.ToString()
+  )
+  return ($parts -join "|")
+}
+$expectedKeys = @($expectedRules | ForEach-Object { RuleKey $_ } | Sort-Object) -join ";"
+$actualKeys = @($actualRules | ForEach-Object { RuleKey $_ } | Sort-Object) -join ";"
+if ($expectedKeys -ne $actualKeys) { exit 1 }
+exit 0
 `;
 
 function evidence(
@@ -220,6 +262,31 @@ async function runPowerShell(script: string, target: string): Promise<string> {
   return stdout;
 }
 
+async function runPowerShellWithSddl(
+  script: string,
+  target: string,
+  sddl: string,
+): Promise<void> {
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const windowsRoot = path.parse(process.env.SystemRoot ?? "C:\\Windows").root;
+  await execFileAsync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+    {
+      windowsHide: true,
+      timeout: 10_000,
+      maxBuffer: 64 * 1024,
+      env: {
+        ...process.env,
+        SystemDrive: windowsRoot.slice(0, 2),
+        ProgramData: path.join(windowsRoot, "ProgramData"),
+        AGENTGLASS_SNAPSHOT_ACL_PATH: target,
+        AGENTGLASS_TARGET_SDDL: sddl,
+      },
+    },
+  );
+}
+
 async function applyWindowsTargetAcl(
   target: string,
   sddl: string,
@@ -227,37 +294,11 @@ async function applyWindowsTargetAcl(
   let lastError: unknown;
   for (let attempt = 0; attempt < WINDOWS_ACL_APPLY_ATTEMPTS; attempt += 1) {
     try {
-      const encoded = Buffer.from(WINDOWS_APPLY_ACL_SCRIPT, "utf16le").toString(
-        "base64",
-      );
-      const windowsRoot = path.parse(
-        process.env.SystemRoot ?? "C:\\Windows",
-      ).root;
-      await execFileAsync(
-        "powershell.exe",
-        [
-          "-NoLogo",
-          "-NoProfile",
-          "-NonInteractive",
-          "-EncodedCommand",
-          encoded,
-        ],
-        {
-          windowsHide: true,
-          timeout: 10_000,
-          maxBuffer: 64 * 1024,
-          env: {
-            ...process.env,
-            SystemDrive: windowsRoot.slice(0, 2),
-            ProgramData: path.join(windowsRoot, "ProgramData"),
-            AGENTGLASS_SNAPSHOT_ACL_PATH: target,
-            AGENTGLASS_TARGET_SDDL: sddl,
-          },
-        },
-      );
-      // Windows 上的 ACL 写回可能在系统调用返回后短暂不可见；只有复读到完全相同的 SDDL 才算成功。
-      if ((await readWindowsTargetAcl(target)) === sddl.trim()) return;
-      lastError = new Error("SNAPSHOT_PERMISSION_DENIED");
+      // 应用后在同一 PowerShell 进程内立即读回并语义比对 DACL：SDDL 字符串往返
+      // 并不保证逐字符稳定（继承标记、SACL、owner/group 都可能归一化），
+      // 因此只比对访问规则（身份/类型/权限/继承传播），失败则重试。
+      await runPowerShellWithSddl(WINDOWS_APPLY_ACL_SCRIPT, target, sddl);
+      return;
     } catch (error) {
       lastError = error;
     }
@@ -266,6 +307,22 @@ async function applyWindowsTargetAcl(
   throw lastError instanceof Error
     ? lastError
     : new Error("SNAPSHOT_PERMISSION_DENIED");
+}
+
+async function daclMatches(
+  target: string,
+  expectedSddl: string,
+): Promise<boolean> {
+  try {
+    await runPowerShellWithSddl(
+      WINDOWS_COMPARE_ACL_SCRIPT,
+      target,
+      expectedSddl,
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function readWindowsTargetAcl(target: string): Promise<string> {
@@ -777,6 +834,21 @@ async function observedPermissions(
   };
 }
 
+async function permissionsMatch(
+  targetPath: string,
+  observed: Awaited<ReturnType<typeof readStableFile>>,
+  expected: FilePermissions,
+): Promise<boolean> {
+  if ((observed.mode & 0o7777) !== expected.mode) return false;
+  if (observed.uid !== expected.uid) return false;
+  if (observed.gid !== expected.gid) return false;
+  if (expected.acl === null) return true;
+  return (
+    expected.acl.format === "sddl" &&
+    (await daclMatches(targetPath, expected.acl.value))
+  );
+}
+
 async function publishManifest(
   snapshotRoot: string,
   manifest: RecoveryManifestV2,
@@ -1012,9 +1084,11 @@ async function verifyRestored(
         ? "matched"
         : "unknown";
     const permissions =
-      JSON.stringify(
-        await observedPermissions(manifest.targetPath, observed),
-      ) === JSON.stringify(manifest.prePermissions)
+      (await permissionsMatch(
+        manifest.targetPath,
+        observed,
+        manifest.prePermissions,
+      ))
         ? "matched"
         : "unknown";
     return {
