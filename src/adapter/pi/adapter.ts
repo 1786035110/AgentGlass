@@ -243,7 +243,16 @@ async function inspectExamplePlan(
     const cwdStats = await lstat(cwd);
     if (cwdStats.isSymbolicLink() || !cwdStats.isDirectory()) return;
     const realCwd = await realpath(cwd);
-    if (!samePath(realCwd, cwd)) return;
+    const realCwdStats = await lstat(realCwd);
+    // Windows runner 可能用 8.3 短路径传入 cwd；文字不同不代表越界，
+    // 用真实目录身份确认它仍是同一个普通目录，同时保留直接符号链接拒绝。
+    if (
+      realCwdStats.isSymbolicLink() ||
+      !realCwdStats.isDirectory() ||
+      String(realCwdStats.dev) !== String(cwdStats.dev) ||
+      String(realCwdStats.ino) !== String(cwdStats.ino)
+    )
+      return;
     const directory = path.join(realCwd, EXAMPLE_DIRECTORY_NAME);
     const file = path.join(directory, EXAMPLE_FILE_NAME);
     if (!samePath(path.dirname(directory), realCwd)) return;
