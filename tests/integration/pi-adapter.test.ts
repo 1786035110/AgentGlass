@@ -63,6 +63,7 @@ async function createRuntime(options?: {
   overriddenRead?: boolean;
   snapshotUnavailable?: boolean;
   bindUI?: boolean;
+  captureStartup?: boolean;
 }) {
   const cwd = await mkdtemp(join(tmpdir(), "agentglass-adapter-"));
   temporaryDirectories.push(cwd);
@@ -118,14 +119,30 @@ async function createRuntime(options?: {
         }
       : {}),
   });
+  const startupWidgets: string[][] = [];
   const uiContext = options?.bindUI
     ? session.extensionRunner.getUIContext()
     : undefined;
+  const startupUIContext: ExtensionUIContext | undefined =
+    uiContext && options?.captureStartup
+      ? {
+          ...uiContext,
+          setWidget: ((
+            key: string,
+            content: string[] | undefined,
+            options?,
+          ) => {
+            if (key === "agentglass-welcome" && Array.isArray(content))
+              startupWidgets.push([...content]);
+            uiContext.setWidget(key, content, options);
+          }) as ExtensionUIContext["setWidget"],
+        }
+      : uiContext;
   await session.bindExtensions({
     mode: options?.bindUI ? "tui" : "print",
-    ...(uiContext ? { uiContext } : {}),
+    ...(startupUIContext ? { uiContext: startupUIContext } : {}),
   });
-  return { cwd, observed, session, sessionManager };
+  return { cwd, observed, session, sessionManager, startupWidgets };
 }
 
 interface ApprovalUiStep {
@@ -354,6 +371,10 @@ test("B-002 keeps one recovery across agent_end, restores through /agentglass, a
     details: undefined,
     isError: false,
   });
+  await runtime.session.prompt("/agentglass help");
+  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain(
+    "当前会话可恢复最近一次",
+  );
   expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("/agentglass");
   await runtime.session.extensionRunner.emit({
     type: "tool_execution_end",
@@ -1626,4 +1647,73 @@ test("B-001 keeps repeated read feedback on one status key", async () => {
     new Set(["agentglass-read"]),
   );
   expect(ui.widgets).toHaveLength(0);
+});
+
+test("B-003 reuses /agentglass for help, the fixed example, conflicts, and cancellation", async () => {
+  const runtime = await createRuntime({
+    bindUI: true,
+    captureStartup: true,
+  });
+  expect(runtime.startupWidgets).toHaveLength(1);
+  expect(runtime.startupWidgets[0]?.join("\n")).toContain("AgentGlass 已启用");
+  await runtime.session.extensionRunner.emit({
+    type: "session_start",
+    reason: "reload",
+  });
+  expect(runtime.startupWidgets).toHaveLength(1);
+  const ui = installApprovalUi(runtime, [
+    { inputs: ["down", "down", "enter"] },
+    { inputs: ["enter"] },
+  ]);
+
+  await runtime.session.prompt("/agentglass help");
+  const help = ui.widgets.at(-1)?.content?.join("\n") ?? "";
+  expect(help).toContain("支持范围");
+  expect(help).toContain("查看文件");
+  expect(help).toContain("切换目录");
+  expect(help).toContain(
+    "安全示例：当前工作文件夹下新建 agentglass-example/活动说明.txt",
+  );
+  expect(help).not.toContain(runtime.cwd);
+  expect(ui.customCalls).toBe(0);
+
+  await runtime.session.prompt("/agentglass example");
+  const examplePath = join(runtime.cwd, "agentglass-example", "活动说明.txt");
+  expect(await readFile(examplePath, "utf8")).toBe(
+    "活动说明\n\n活动名称：社区旧物交换日\n时间：周六 10:00—15:00\n地点：社区活动室\n安排：带来闲置物品，现场登记后交换。\n报名：现场登记。\n",
+  );
+  expect(ui.customCalls).toBe(1);
+
+  await runtime.session.prompt("/agentglass help");
+  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("最近结果");
+  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("安全示例已准备");
+
+  await runtime.session.prompt("/agentglass example");
+  expect(ui.customCalls).toBe(1);
+  expect(ui.notifications.at(-1)?.message).toContain("不会覆盖已有目录或文件");
+
+  await rm(join(runtime.cwd, "agentglass-example"), {
+    recursive: true,
+    force: true,
+  });
+  await runtime.session.prompt("/agentglass example");
+  expect(ui.customCalls).toBe(2);
+  expect(ui.notifications.at(-1)?.message).toContain("没有创建目录或文件");
+  expect(
+    await readFile(
+      join(runtime.cwd, "agentglass-example", "活动说明.txt"),
+      "utf8",
+    ).catch(() => undefined),
+  ).toBeUndefined();
+});
+
+test("B-003 blocks example preparation without interactive UI", async () => {
+  const runtime = await createRuntime();
+  await runtime.session.prompt("/agentglass example");
+  expect(
+    await readFile(
+      join(runtime.cwd, "agentglass-example", "活动说明.txt"),
+      "utf8",
+    ).catch(() => undefined),
+  ).toBeUndefined();
 });

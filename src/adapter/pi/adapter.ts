@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
+import path from "node:path";
 import type {
   EditToolInput,
   ExtensionAPI,
@@ -41,7 +43,10 @@ import {
   unverifiableResult,
   verifyFilePostcondition,
 } from "../../core/file-verification.js";
-import { fingerprintTransientActionInput } from "../../core/input-boundary.js";
+import {
+  fingerprintTransientActionInput,
+  redactDisplayString,
+} from "../../core/input-boundary.js";
 import {
   renderOutcomeCard,
   renderOutcomeCardUpdate,
@@ -86,6 +91,14 @@ const BACKUP_BLOCK_REASON =
   "已停止：未能取得这次修改所需的修改前证据，或这一步会创建缺少的上级文件夹。请明确选择已有文件夹中的一份普通文件后重试。";
 const READ_STATUS_KEY = "agentglass-read";
 const ACTION_CARD_KEY = "agentglass-action";
+const WELCOME_WIDGET_KEY = "agentglass-welcome";
+const EXAMPLE_DIRECTORY_NAME = "agentglass-example";
+const EXAMPLE_FILE_NAME = "活动说明.txt";
+const EXAMPLE_RELATIVE_FILE = `${EXAMPLE_DIRECTORY_NAME}/${EXAMPLE_FILE_NAME}`;
+const EXAMPLE_GOAL = "帮我修改这份活动说明";
+// 这段内容是随扩展发布的固定无秘密示例；只用于明确的示例准备，不从用户输入读取，也不覆盖已有路径。
+const EXAMPLE_ACTIVITY_TEXT =
+  "活动说明\n\n活动名称：社区旧物交换日\n时间：周六 10:00—15:00\n地点：社区活动室\n安排：带来闲置物品，现场登记后交换。\n报名：现场登记。\n";
 
 // 仅区分“批次无法证明”和其他宿主身份失败，以选择真实且脱敏的固定原因；异常文本从不返回 Pi。
 class SiblingContextError extends Error {}
@@ -104,6 +117,14 @@ interface SessionRecoveryEntry extends RecoveryEntry {
   sessionId: string;
   cwd: string;
   targetLabel: string;
+}
+
+interface ExamplePlan {
+  cwd: string;
+  realCwd: string;
+  cwdIdentity: { dev: string; ino: string };
+  directory: string;
+  file: string;
 }
 
 const knownBuiltinNames = new Set([
@@ -131,6 +152,158 @@ function hostExecutionId(sessionId: string, toolCallId: string): string {
 
 function wrapLine(line: string, width: number): string[] {
   return line ? wrapTextWithAnsi(line, Math.max(1, width)) : [""];
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = path.resolve(left);
+  const normalizedRight = path.resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function safeDirectoryLabel(cwd: string): string {
+  try {
+    const base = path.basename(path.resolve(cwd));
+    const visible = redactDisplayString(base)
+      .replace(/\p{Cc}/gu, "")
+      .trim();
+    const bounded = [...(visible || "当前工作文件夹")];
+    return bounded.length > 80
+      ? `${bounded.slice(0, 79).join("")}…`
+      : bounded.join("");
+  } catch {
+    return "当前工作文件夹（位置无法确认）";
+  }
+}
+
+function setWelcomePanel(
+  ctx: ExtensionContext,
+  lines: readonly string[],
+): void {
+  if (ctx.mode !== "tui" || !ctx.hasUI) return;
+  try {
+    // 欢迎/帮助是同一入口的非审批信息面板；不创建第二套 UI，也不把面板文字送回风险层。
+    ctx.ui.setWidget(WELCOME_WIDGET_KEY, [...lines]);
+  } catch {
+    // UI 失败只影响说明展示，不改变文件或恢复状态。
+  }
+}
+
+function welcomeLines(cwd: string): readonly string[] {
+  return Object.freeze([
+    "AgentGlass 已启用",
+    `当前工作文件夹：${safeDirectoryLabel(cwd)}（完整路径不显示）`,
+    "支持：查看、创建或修改当前项目内的普通文本文件。",
+    "变更会先说明预期影响；需要修改时，每一步都要单独取得你的明确同意。",
+    "输入 /agentglass 查看帮助、准备安全示例，或使用最近一次恢复。",
+    "需要已配置模型的 Pi；AgentGlass 不提供安装器、账号或密钥。",
+  ]);
+}
+
+function helpLines(
+  cwd: string,
+  latestResult: readonly string[] | undefined,
+  recovery: SessionRecoveryEntry | undefined,
+): readonly string[] {
+  const lines = [
+    "AgentGlass 帮助",
+    `当前工作文件夹：${safeDirectoryLabel(cwd)}（完整路径不显示）`,
+    "",
+    "支持范围：只处理已验证的普通项目文件查看、创建和修改；只独立核对卡片列出的文件。",
+    "不支持：shell、安装软件、启动或部署项目、联网、批量删除、自定义或覆盖工具。",
+    "审批：停止是默认选择；查看详情不会同意，只有明确选择“继续这次修改”才会执行。",
+    recovery
+      ? `恢复：当前会话可恢复最近一次“${recovery.targetLabel}”；输入 /agentglass restore。`
+      : "恢复：当前没有可用的最近恢复入口。",
+    "清理：只清理已验证归属的 AgentGlass 私有恢复数据；会单独说明数量和能力损失并再次征求同意。",
+    "冲突、损坏、未知或切换会话后不会强行恢复；当前文件会被保留。",
+    "查看文件：请在对话中请求 Pi 查看当前项目内的文件；本入口不会启动 shell 或额外程序。",
+    "切换目录：本入口没有可靠的目录切换能力；请用 Pi 已有方式打开/切换目标项目，确认当前文件夹后再输入 /agentglass。",
+    `安全示例：当前工作文件夹下新建 ${EXAMPLE_RELATIVE_FILE}，不会覆盖已有同名目录或文件。`,
+    `示例目标：${EXAMPLE_GOAL}`,
+    "准备示例目录本身不提供目录恢复；部分失败会保留已创建内容并如实说明，不自动删除。",
+    "上手前提：Pi 需要已经配置模型；空白电脑安装、模型账号和安装器不属于 AgentGlass。",
+  ];
+  if (latestResult) {
+    lines.push("", "最近结果：", ...latestResult);
+  } else {
+    lines.push("", "最近结果：本次会话还没有 AgentGlass 文件结果。");
+  }
+  return Object.freeze(lines);
+}
+
+async function inspectExamplePlan(
+  cwd: string,
+): Promise<ExamplePlan | "conflict" | undefined> {
+  // 示例是唯一允许 AgentGlass 自己准备目录的固定路径：先确认当前 cwd 是真实普通目录，
+  // 再确认直接子目录不存在。这里不复用普通 write 的隐式父目录逻辑，也不接受用户路径。
+  try {
+    if (!nonEmptyString(cwd) || !path.isAbsolute(cwd)) return;
+    const cwdStats = await lstat(cwd);
+    if (cwdStats.isSymbolicLink() || !cwdStats.isDirectory()) return;
+    const realCwd = await realpath(cwd);
+    if (!samePath(realCwd, cwd)) return;
+    const directory = path.join(realCwd, EXAMPLE_DIRECTORY_NAME);
+    const file = path.join(directory, EXAMPLE_FILE_NAME);
+    if (!samePath(path.dirname(directory), realCwd)) return;
+    try {
+      await lstat(directory);
+      return "conflict";
+    } catch (error) {
+      if (
+        !error ||
+        typeof error !== "object" ||
+        !("code" in error) ||
+        error.code !== "ENOENT"
+      )
+        return;
+    }
+    return {
+      cwd,
+      realCwd,
+      cwdIdentity: { dev: String(cwdStats.dev), ino: String(cwdStats.ino) },
+      directory,
+      file,
+    };
+  } catch {
+    return;
+  }
+}
+
+async function examplePlanIsCurrent(
+  plan: ExamplePlan,
+  ctx: ExtensionContext,
+): Promise<boolean> {
+  // 审批等待期间重新核对 cwd 身份和固定目标，避免把批准带到切换后的目录或竞态创建的目录。
+  try {
+    if (
+      !samePath(ctx.cwd, plan.cwd) ||
+      !samePath(await realpath(ctx.cwd), plan.realCwd)
+    )
+      return false;
+    const cwdStats = await lstat(ctx.cwd);
+    if (
+      cwdStats.isSymbolicLink() ||
+      !cwdStats.isDirectory() ||
+      String(cwdStats.dev) !== plan.cwdIdentity.dev ||
+      String(cwdStats.ino) !== plan.cwdIdentity.ino
+    )
+      return false;
+  } catch {
+    return false;
+  }
+  try {
+    await lstat(plan.directory);
+    return false;
+  } catch (error) {
+    return Boolean(
+      error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "ENOENT",
+    );
+  }
 }
 
 async function requestOutcomeApproval(
@@ -625,6 +798,8 @@ export function registerPiAdapter(
   const pendingTokens = new Set<ApprovalToken>();
   const pendingApprovalCancels = new Set<() => void>();
   let latestRecovery: SessionRecoveryEntry | undefined;
+  let latestResult: readonly string[] | undefined;
+  let welcomedCwd: string | undefined;
   let runGeneration = 0;
 
   const clearRun = (ctx?: ExtensionContext): void => {
@@ -715,7 +890,10 @@ export function registerPiAdapter(
   };
 
   const internalBinding = (
-    toolName: "agentglass.restore" | "agentglass.cleanup",
+    toolName:
+      | "agentglass.example"
+      | "agentglass.restore"
+      | "agentglass.cleanup",
     ctx: ExtensionContext,
     toolCallId: string,
     payload: Record<string, unknown>,
@@ -745,8 +923,213 @@ export function registerPiAdapter(
     }
   };
 
+  const rememberResult = (lines: readonly string[]): void => {
+    latestResult = Object.freeze([...lines]);
+  };
+
+  const showWelcome = (ctx: ExtensionContext): void => {
+    setWelcomePanel(ctx, welcomeLines(ctx.cwd));
+  };
+
+  const showHelp = async (ctx: ExtensionContext): Promise<void> => {
+    let recovery = latestRecovery;
+    if (recovery) {
+      try {
+        if (!(await recoveryEntryIsCurrent(snapshotRoot, recovery))) {
+          if (latestRecovery === recovery) latestRecovery = undefined;
+          recovery = undefined;
+        }
+      } catch {
+        recovery = undefined;
+      }
+    }
+    setWelcomePanel(ctx, helpLines(ctx.cwd, latestResult, recovery));
+  };
+
+  const prepareExample = async (ctx: ExtensionContext): Promise<void> => {
+    const inspected = await inspectExamplePlan(ctx.cwd);
+    if (inspected === "conflict") {
+      notify(
+        ctx,
+        `未准备安全示例：当前文件夹下的 ${EXAMPLE_DIRECTORY_NAME} 已存在，AgentGlass 不会覆盖已有目录或文件。请换一个空的当前文件夹后重试。`,
+        "warning",
+      );
+      return;
+    }
+    if (!inspected) {
+      notify(
+        ctx,
+        "未准备安全示例：无法可靠确认当前工作文件夹的位置或类型。请在普通项目文件夹中重试。",
+        "warning",
+      );
+      return;
+    }
+
+    let currentSession: string;
+    try {
+      currentSession = ctx.sessionManager.getSessionId();
+    } catch {
+      notify(
+        ctx,
+        "未准备安全示例：无法确认当前会话。请重新打开项目后重试。",
+        "warning",
+      );
+      return;
+    }
+    if (!nonEmptyString(currentSession)) {
+      notify(
+        ctx,
+        "未准备安全示例：无法确认当前会话。请重新打开项目后重试。",
+        "warning",
+      );
+      return;
+    }
+
+    const callId = randomUUID();
+    const payload = {
+      cwd: inspected.cwd,
+      directory: inspected.directory,
+      file: inspected.file,
+      contentSha256: createHash("sha256")
+        .update(EXAMPLE_ACTIVITY_TEXT, "utf8")
+        .digest("hex"),
+    };
+    let token: ApprovalToken;
+    try {
+      token = issueApprovalToken(
+        callId,
+        internalBinding("agentglass.example", ctx, callId, payload),
+      );
+    } catch {
+      notify(
+        ctx,
+        "未准备安全示例：无法建立这次精确批准。请重新打开项目后重试。",
+        "warning",
+      );
+      return;
+    }
+    pendingTokens.add(token);
+    const choice = await requestOutcomeApproval(
+      ctx,
+      Object.freeze({
+        actionId: callId,
+        title: "下一步：准备安全示例",
+        expectedOutcome: `预计结果：在当前工作文件夹下创建 ${EXAMPLE_RELATIVE_FILE}。`,
+        attention:
+          "需要注意：这里只创建这个固定示例目录和文件，不会覆盖已有内容；目录本身不提供自动恢复。",
+        recovery:
+          "恢复：示例目录准备不是可恢复的文件修改；部分失败会保留已创建内容。",
+        details: [
+          `位置：当前工作文件夹下的 ${EXAMPLE_RELATIVE_FILE}。`,
+          "内容：固定无秘密活动说明，不读取或保存你的私密信息。",
+          `下一步目标：${EXAMPLE_GOAL}；之后的修改仍会走普通文件审批和恢复链路。`,
+        ],
+      }),
+      pendingApprovalCancels,
+    );
+    if (choice !== "continue") {
+      invalidateApprovalToken(token);
+      pendingTokens.delete(token);
+      notify(ctx, "已停止：未批准准备安全示例，没有创建目录或文件。");
+      return;
+    }
+    if (!(await examplePlanIsCurrent(inspected, ctx))) {
+      invalidateApprovalToken(token);
+      pendingTokens.delete(token);
+      notify(
+        ctx,
+        "已停止：批准期间当前文件夹或示例位置发生变化，没有创建目录或文件。",
+        "warning",
+      );
+      return;
+    }
+    let finalBinding: Readonly<ExecutionBinding>;
+    try {
+      finalBinding = internalBinding(
+        "agentglass.example",
+        ctx,
+        callId,
+        payload,
+      );
+    } catch {
+      invalidateApprovalToken(token);
+      pendingTokens.delete(token);
+      notify(
+        ctx,
+        "已停止：批准期间无法确认当前会话或文件夹，没有创建目录或文件。",
+        "warning",
+      );
+      return;
+    }
+    if (!consumeApprovalToken(token, callId, finalBinding)) {
+      pendingTokens.delete(token);
+      notify(ctx, APPROVAL_CHANGED_REASON, "warning");
+      return;
+    }
+    pendingTokens.delete(token);
+
+    let directoryCreated = false;
+    try {
+      await mkdir(inspected.directory);
+      directoryCreated = true;
+      await writeFile(inspected.file, EXAMPLE_ACTIVITY_TEXT, {
+        encoding: "utf8",
+        flag: "wx",
+      });
+      const result = [
+        "安全示例已准备。",
+        `已创建：当前工作文件夹下的 ${EXAMPLE_RELATIVE_FILE}。`,
+        "内容：固定无秘密活动说明。",
+        `下一步目标：${EXAMPLE_GOAL}。`,
+        "未覆盖已有内容；示例目录本身不提供自动恢复。",
+      ];
+      rememberResult(result);
+      setActionCard(ctx, {
+        actionId: callId,
+        state: "matched",
+        lines: result,
+      });
+      setWelcomePanel(ctx, result);
+      notify(ctx, `安全示例已准备：可在对话中使用“${EXAMPLE_GOAL}”。`);
+    } catch {
+      let fileExists = false;
+      let directoryExists = false;
+      try {
+        fileExists = (await lstat(inspected.file)).isFile();
+      } catch {
+        // 文件不存在或无法读取都不能被写成“没有创建”。
+      }
+      try {
+        await lstat(inspected.directory);
+        directoryExists = true;
+      } catch {
+        // 目录不存在或无法读取都不能被写成“没有创建”。
+      }
+      const result = [
+        "安全示例准备未完成。",
+        fileExists
+          ? "活动说明文件已经出现，但内容无法确认。"
+          : directoryCreated
+            ? "已创建示例文件夹，但活动说明文件未完成。"
+            : directoryExists
+              ? "示例位置已经出现，但无法确认其创建者或内容。"
+              : "没有确认创建任何示例内容。",
+        "已保留已创建内容，未自动删除；示例目录本身不提供自动恢复。",
+      ];
+      rememberResult(result);
+      setActionCard(ctx, {
+        actionId: callId,
+        state: "unknown",
+        lines: result,
+      });
+      setWelcomePanel(ctx, result);
+      notify(ctx, result.join(" "), "warning");
+    }
+  };
+
   pi.registerCommand("agentglass", {
-    description: "查看或使用最近一次单文件恢复，并管理本地恢复数据",
+    description:
+      "查看 AgentGlass 帮助、准备安全示例、恢复最近修改或清理本地恢复数据",
     handler: async (args, ctx) => {
       let commandSession: string | undefined;
       try {
@@ -768,19 +1151,54 @@ export function registerPiAdapter(
         notify(ctx, APPROVAL_UNAVAILABLE_REASON, "warning");
         return;
       }
+      let menuHasRecovery = Boolean(latestRecovery);
+      if (latestRecovery) {
+        try {
+          menuHasRecovery = await recoveryEntryIsCurrent(
+            snapshotRoot,
+            latestRecovery,
+          );
+        } catch {
+          menuHasRecovery = false;
+        }
+      }
       let action = args.trim().toLowerCase();
       if (!action) {
         const choice = await ctx.ui.select("AgentGlass", [
-          ...(latestRecovery ? ["恢复最近一次修改"] : []),
+          "查看欢迎与帮助",
+          "准备安全示例",
+          ...(menuHasRecovery ? ["恢复最近一次修改"] : []),
           "清理本地恢复数据",
           "关闭",
         ]);
         action =
-          choice === "恢复最近一次修改"
-            ? "restore"
-            : choice === "清理本地恢复数据"
-              ? "cleanup"
-              : "";
+          choice === "查看欢迎与帮助"
+            ? "help"
+            : choice === "准备安全示例"
+              ? "example"
+              : choice === "恢复最近一次修改"
+                ? "restore"
+                : choice === "清理本地恢复数据"
+                  ? "cleanup"
+                  : "";
+      }
+      if (
+        action === "help" ||
+        action === "welcome" ||
+        action === "帮助" ||
+        action === "欢迎"
+      ) {
+        await showHelp(ctx);
+        return;
+      }
+      if (
+        action === "example" ||
+        action === "示例" ||
+        action === "准备示例" ||
+        action === "试一个例子"
+      ) {
+        await prepareExample(ctx);
+        return;
       }
       if (action === "restore" || action === "恢复") {
         const entry = latestRecovery;
@@ -864,6 +1282,17 @@ export function registerPiAdapter(
         pendingTokens.delete(token);
         latestRecovery = undefined;
         const result = await restoreRecoveryEntry(snapshotRoot, entry);
+        const resultLines = Object.freeze([
+          result.status === "restored"
+            ? `已确认：${entry.targetLabel} 已恢复到这次修改之前。`
+            : result.status === "conflict"
+              ? `已停止：${entry.targetLabel} 已变化，保留当前文件。`
+              : `无法确认：${entry.targetLabel} 的恢复结果。`,
+          `内容/存在状态：${result.content === "matched" ? "已匹配修改前副本" : result.content === "missing" ? "已确认文件不存在" : "未确认"}。`,
+          `权限：${result.permissions === "matched" ? "已匹配记录" : result.permissions === "not_applicable" ? "不适用" : "未确认"}。`,
+          "这次恢复入口已消费；不会自动重试或创建 redo。",
+        ]);
+        rememberResult(resultLines);
         setActionCard(ctx, {
           actionId: callId,
           state:
@@ -872,16 +1301,7 @@ export function registerPiAdapter(
               : result.status === "conflict"
                 ? "mismatch"
                 : "unknown",
-          lines: Object.freeze([
-            result.status === "restored"
-              ? `已确认：${entry.targetLabel} 已恢复到这次修改之前。`
-              : result.status === "conflict"
-                ? `已停止：${entry.targetLabel} 已变化，保留当前文件。`
-                : `无法确认：${entry.targetLabel} 的恢复结果。`,
-            `内容/存在状态：${result.content === "matched" ? "已匹配修改前副本" : result.content === "missing" ? "已确认文件不存在" : "未确认"}。`,
-            `权限：${result.permissions === "matched" ? "已匹配记录" : result.permissions === "not_applicable" ? "不适用" : "未确认"}。`,
-            "这次恢复入口已消费；不会自动重试或创建 redo。",
-          ]),
+          lines: resultLines,
         });
         return;
       }
@@ -956,6 +1376,14 @@ export function registerPiAdapter(
         ) {
           latestRecovery = undefined;
         }
+        const cleanupResult = Object.freeze([
+          `清理结果：已删除 ${result.deleted} 个文件，${result.failed} 个失败并已保留。`,
+          result.changed
+            ? "待清理集合在批准期间发生变化，未继续删除。"
+            : "只处理了已验证归属的 AgentGlass 私有数据。",
+        ]);
+        rememberResult(cleanupResult);
+        setWelcomePanel(ctx, cleanupResult);
         notify(
           ctx,
           `清理结果：已删除 ${result.deleted} 个文件，${result.failed} 个失败并已保留。`,
@@ -963,18 +1391,32 @@ export function registerPiAdapter(
         );
         return;
       }
-      notify(ctx, "可用操作：/agentglass restore 或 /agentglass cleanup。");
+      if (action)
+        notify(
+          ctx,
+          "可用操作：/agentglass help、/agentglass example、/agentglass restore 或 /agentglass cleanup。",
+        );
     },
   });
 
   pi.on("session_start", (_event, ctx) => {
     clearRun();
     latestRecovery = undefined;
+    latestResult = undefined;
     try {
       const current = ctx.sessionManager.getSessionId();
       sessionId = nonEmptyString(current) ? current : undefined;
     } catch {
       sessionId = undefined;
+    }
+    if (
+      ctx.mode === "tui" &&
+      ctx.hasUI &&
+      nonEmptyString(ctx.cwd) &&
+      welcomedCwd !== ctx.cwd
+    ) {
+      welcomedCwd = ctx.cwd;
+      showWelcome(ctx);
     }
   });
   pi.on("before_agent_start", (event) => {
@@ -1316,15 +1758,14 @@ export function registerPiAdapter(
     ) {
       return;
     }
-    setActionCard(
-      ctx,
-      renderOutcomeCardUpdate(
-        pending.action,
-        pending.effect,
-        report,
-        recoveryAvailable,
-      ),
+    const resultUpdate = renderOutcomeCardUpdate(
+      pending.action,
+      pending.effect,
+      report,
+      recoveryAvailable,
     );
+    rememberResult(resultUpdate.lines);
+    setActionCard(ctx, resultUpdate);
     pendingVerifications.delete(event.toolCallId);
   });
   pi.on("tool_execution_end", (event, ctx) => {
@@ -1347,18 +1788,17 @@ export function registerPiAdapter(
     if (!endMatches) return;
     const pending = pendingVerifications.get(event.toolCallId);
     if (pending && !pending.inFlight) {
-      setActionCard(
-        ctx,
-        renderOutcomeCardUpdate(
-          pending.action,
-          pending.effect,
-          unverifiableResult(
-            pending.expected,
-            event.isError ? "failed" : "unknown",
-            "RESULT_MISSING",
-          ),
+      const resultUpdate = renderOutcomeCardUpdate(
+        pending.action,
+        pending.effect,
+        unverifiableResult(
+          pending.expected,
+          event.isError ? "failed" : "unknown",
+          "RESULT_MISSING",
         ),
       );
+      rememberResult(resultUpdate.lines);
+      setActionCard(ctx, resultUpdate);
       pendingVerifications.delete(event.toolCallId);
     }
     if (pendingReads.delete(event.toolCallId))

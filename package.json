@@ -17,7 +17,8 @@
   ],
   "files": [
     "extensions",
-    "dist"
+    "dist",
+    "src"
   ],
   "pi": {
     "extensions": [

@@ -508,6 +508,48 @@ describe.sequential("A-016 Pi 0.85.1 real dispatch E2E", () => {
     expect(ui.customCalls).toBe(3);
   });
 
+  test("B-003 real Pi package entry prepares the safe example, edits it, restores it, and cleans snapshots", async () => {
+    const runtime = await createRuntime();
+    const ui = installApprovalUi(runtime, [
+      { inputs: ["down", "down", "enter"] },
+      { inputs: ["down", "down", "enter"] },
+      { inputs: ["down", "down", "enter"] },
+      { inputs: ["down", "down", "enter"] },
+    ]);
+
+    await runtime.session.prompt("/agentglass example");
+    const examplePath = join(runtime.cwd, "agentglass-example", "活动说明.txt");
+    expect(await readFile(examplePath, "utf8")).toContain("社区旧物交换日");
+
+    await promptCalls(
+      runtime,
+      [
+        {
+          type: "toolCall",
+          id: "edit-example",
+          name: "edit",
+          arguments: {
+            path: "agentglass-example/活动说明.txt",
+            edits: [{ oldText: "现场登记。", newText: "网上登记。" }],
+          },
+        },
+      ],
+      "帮我修改这份活动说明",
+    );
+    expect(await readFile(examplePath, "utf8")).toContain("网上登记。");
+    expect(ui.customCalls).toBe(2);
+
+    await runtime.session.prompt("/agentglass restore");
+    expect(await readFile(examplePath, "utf8")).toContain("现场登记。");
+    expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("已恢复");
+
+    await runtime.session.prompt("/agentglass cleanup");
+    expect(
+      await readdir(join(runtime.agentDir, ".agentglass", "snapshots")),
+    ).toEqual([]);
+    expect(ui.customCalls).toBe(4);
+  });
+
   test("Stop stays focused; details do not approve; Continue, Stop, Esc, and cancel remain distinct", async () => {
     const cases: Array<{
       name: string;
