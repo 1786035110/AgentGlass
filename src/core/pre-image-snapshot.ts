@@ -1083,14 +1083,13 @@ async function verifyRestored(
         manifest.preImage.sha256
         ? "matched"
         : "unknown";
-    const permissions =
-      (await permissionsMatch(
-        manifest.targetPath,
-        observed,
-        manifest.prePermissions,
-      ))
-        ? "matched"
-        : "unknown";
+    const permissions = (await permissionsMatch(
+      manifest.targetPath,
+      observed,
+      manifest.prePermissions,
+    ))
+      ? "matched"
+      : "unknown";
     return {
       status:
         content === "matched" && permissions === "matched"
