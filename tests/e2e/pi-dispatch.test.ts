@@ -27,7 +27,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+// 允许 R-002 将同一套真实 Pi 调度回归切换到 npm tarball 的隔离安装目录；
+// 这是测试侧注入，不进入产品代码，也不改变生产扩展的加载边界。
+const packageRoot =
+  process.env.AGENTGLASS_E2E_PACKAGE_ROOT ??
+  fileURLToPath(new URL("../../", import.meta.url));
 const extensionEntry = join(packageRoot, "extensions", "agentglass.ts");
 const temporaryRoots: string[] = [];
 const liveSessions: Array<{ dispose(): void }> = [];
@@ -159,8 +163,12 @@ async function createRuntime(options?: {
   breakSnapshotStorage?: boolean;
   customTools?: ToolDefinition[];
 }): Promise<E2ERuntime> {
-  const root = await mkdtemp(join(tmpdir(), "agentglass-e2e-"));
-  temporaryRoots.push(root);
+  // R-002 可指定一个隔离持久根来检查卸载后的私有副本保留；普通测试仍使用
+  // 自动清理的临时目录，避免测试证据目录进入产品或用户数据范围。
+  const persistentRoot = process.env.AGENTGLASS_E2E_PERSISTENT_ROOT;
+  const root =
+    persistentRoot ?? (await mkdtemp(join(tmpdir(), "agentglass-e2e-")));
+  if (!persistentRoot) temporaryRoots.push(root);
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");
   await Promise.all([mkdir(cwd), mkdir(agentDir)]);

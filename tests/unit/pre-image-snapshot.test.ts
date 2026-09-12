@@ -77,7 +77,7 @@ test("captures an existing regular file, its identity, bytes, and permissions", 
   });
   const saved = await manifest(snapshotRoot, result.snapshotId);
   expect(saved).toMatchObject({
-    schemaVersion: 2,
+    schemaVersion: 3,
     kind: "agentglass-single-file-recovery",
     state: "prepared",
     actionId: "action-existing",
@@ -290,9 +290,10 @@ test("B-002 cleanup binds the verified set and preserves corrupt/future data", a
   expect(await readFile(interrupted, "utf8")).toBe("incomplete");
 });
 
-test("B-002 refuses schema v1, future, corrupt, and prepared-only data as recovery authorization", async () => {
+test("B-002 refuses legacy v1/v2, future, corrupt, and prepared-only data as recovery authorization", async () => {
   for (const replacement of [
     { schemaVersion: 1, kind: "agentglass-pre-image" },
+    { schemaVersion: 2, kind: "agentglass-single-file-recovery" },
     { schemaVersion: 99, kind: "agentglass-single-file-recovery" },
     "{broken",
   ]) {

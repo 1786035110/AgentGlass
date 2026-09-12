@@ -1,6 +1,6 @@
 {
-  "name": "agentglass",
-  "version": "0.1.0-alpha.0",
+  "name": "@ddt/agentglass",
+  "version": "0.8.0",
   "description": "A novice outcome-approval layer for supported Pi file changes.",
   "type": "module",
   "engines": {
@@ -11,7 +11,7 @@
     "type": "git",
     "url": "https://github.com/1786035110/AgentGlass.git"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "keywords": [
     "pi-package"
   ],
@@ -36,8 +36,8 @@
     "test:e2e": "vitest run tests/e2e --testTimeout=30000"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": ">=0.84.3 <=0.85.1",
+    "@earendil-works/pi-tui": ">=0.84.3 <=0.85.1"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.12",

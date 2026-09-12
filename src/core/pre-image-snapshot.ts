@@ -40,8 +40,8 @@ export type SnapshotFailureInjection =
   | "disk_full"
   | "interrupted_publish";
 
-interface RecoveryManifestV2 {
-  schemaVersion: 2;
+interface RecoveryManifestV3 {
+  schemaVersion: 3;
   kind: "agentglass-single-file-recovery";
   state: "prepared" | "ready" | "consumed" | "superseded";
   snapshotId: string;
@@ -63,7 +63,7 @@ interface RecoveryManifestV2 {
   postImage: null | {
     byteLength: number;
     sha256: string;
-    identity: { device: string; inode: string };
+    identity: { device: string; inode: string; changeTimeMs: string };
     permissions: FilePermissions;
   };
 }
@@ -528,8 +528,10 @@ export async function capturePreImageSnapshot(
       captured && process.platform === "win32"
         ? await readWindowsTargetAcl(target.targetPath)
         : undefined;
-    const manifest: RecoveryManifestV2 = {
-      schemaVersion: 2,
+    const manifest: RecoveryManifestV3 = {
+      // v3 绑定 post-image 的 ctime，避免 POSIX 删除后复用 inode 时误认替换文件。
+      // 旧 v2 数据保留但不再作为恢复授权；没有迁移证据时必须安全拒绝。
+      schemaVersion: 3,
       kind: "agentglass-single-file-recovery",
       state: "prepared",
       snapshotId,
@@ -662,9 +664,9 @@ export async function verifyPreImageSnapshotBaseline(
     const parsed: unknown = JSON.parse(bytes.toString("utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
       return false;
-    const manifest = parsed as RecoveryManifestV2;
+    const manifest = parsed as RecoveryManifestV3;
     if (
-      manifest.schemaVersion !== 2 ||
+      manifest.schemaVersion !== 3 ||
       manifest.kind !== "agentglass-single-file-recovery" ||
       manifest.state !== "prepared" ||
       manifest.snapshotId !== snapshot.snapshotId ||
@@ -774,7 +776,7 @@ function validPermissions(value: unknown): value is FilePermissions {
 async function readRecoveryManifest(
   snapshotRoot: string,
   snapshotId: string,
-): Promise<RecoveryManifestV2> {
+): Promise<RecoveryManifestV3> {
   if (!SNAPSHOT_ID.test(snapshotId)) fail("SNAPSHOT_STORAGE_UNSAFE");
   const { bytes } = await readBounded(
     path.join(snapshotRoot, `${snapshotId}.manifest.json`),
@@ -783,9 +785,9 @@ async function readRecoveryManifest(
   const parsed: unknown = JSON.parse(bytes.toString("utf8"));
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
     fail("SNAPSHOT_STORAGE_UNSAFE");
-  const manifest = parsed as RecoveryManifestV2;
+  const manifest = parsed as RecoveryManifestV3;
   if (
-    manifest.schemaVersion !== 2 ||
+    manifest.schemaVersion !== 3 ||
     manifest.kind !== "agentglass-single-file-recovery" ||
     !["prepared", "ready", "consumed", "superseded"].includes(manifest.state) ||
     manifest.snapshotId !== snapshotId ||
@@ -851,8 +853,8 @@ async function permissionsMatch(
 
 async function publishManifest(
   snapshotRoot: string,
-  manifest: RecoveryManifestV2,
-  expectedState: RecoveryManifestV2["state"],
+  manifest: RecoveryManifestV3,
+  expectedState: RecoveryManifestV3["state"],
 ): Promise<void> {
   let lock: Awaited<ReturnType<typeof open>> | undefined;
   const manifestPath = path.join(
@@ -935,14 +937,19 @@ export async function finalizeRecoverySnapshot(
     ) {
       return;
     }
-    const ready: RecoveryManifestV2 = {
+    const ready: RecoveryManifestV3 = {
       ...manifest,
       state: "ready",
       effectId,
       postImage: {
         byteLength: observed.bytes.length,
         sha256: expectedSha256,
-        identity: observed.identity,
+        // POSIX 可在 unlink/recreate 后复用 inode；ctime 只进入敏感 manifest，
+        // 恢复前必须再次精确匹配，不能把同字节替换误认成原文件。
+        identity: {
+          ...observed.identity,
+          changeTimeMs: String(observed.stats.ctimeMs),
+        },
         permissions: await observedPermissions(manifest.targetPath, observed),
       },
     };
@@ -965,7 +972,7 @@ export async function finalizeRecoverySnapshot(
 async function readyManifest(
   snapshotRoot: string,
   entry: RecoveryEntry,
-): Promise<RecoveryManifestV2 | undefined> {
+): Promise<RecoveryManifestV3 | undefined> {
   try {
     const manifest = await readRecoveryManifest(snapshotRoot, entry.snapshotId);
     if (
@@ -983,6 +990,7 @@ async function readyManifest(
       !/^[0-9a-f]{64}$/u.test(manifest.postImage.sha256) ||
       !nonEmpty(manifest.postImage.identity?.device) ||
       !nonEmpty(manifest.postImage.identity?.inode) ||
+      !nonEmpty(manifest.postImage.identity?.changeTimeMs) ||
       !validPermissions(manifest.postImage.permissions)
     ) {
       return;
@@ -994,7 +1002,7 @@ async function readyManifest(
 }
 
 async function matchesPostImage(
-  manifest: RecoveryManifestV2,
+  manifest: RecoveryManifestV3,
 ): Promise<boolean> {
   if (!manifest.postImage) return false;
   try {
@@ -1009,6 +1017,8 @@ async function matchesPostImage(
         manifest.postImage.sha256 &&
       current.identity.device === manifest.postImage.identity.device &&
       current.identity.inode === manifest.postImage.identity.inode &&
+      String(current.stats.ctimeMs) ===
+        manifest.postImage.identity.changeTimeMs &&
       JSON.stringify(permissions) ===
         JSON.stringify(manifest.postImage.permissions)
     );
@@ -1043,7 +1053,7 @@ export async function markRecoveryState(
 }
 
 async function verifyRestored(
-  manifest: RecoveryManifestV2,
+  manifest: RecoveryManifestV3,
 ): Promise<RecoveryResult> {
   if (!manifest.targetExisted) {
     try {

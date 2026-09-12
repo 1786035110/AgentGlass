@@ -15,14 +15,14 @@ test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", asy
     await readFile(join(root, "package.json"), "utf8"),
   );
   expect(manifest).toMatchObject({
-    name: "agentglass",
+    name: "@ddt/agentglass",
     type: "module",
     engines: { node: ">=22.19.0" },
     keywords: ["pi-package"],
     pi: { extensions: ["extensions/agentglass.ts"] },
     peerDependencies: {
-      "@earendil-works/pi-coding-agent": "*",
-      "@earendil-works/pi-tui": "*",
+      "@earendil-works/pi-coding-agent": ">=0.84.3 <=0.85.1",
+      "@earendil-works/pi-tui": ">=0.84.3 <=0.85.1",
     },
     devDependencies: {
       "@earendil-works/pi-coding-agent": "0.85.1",
